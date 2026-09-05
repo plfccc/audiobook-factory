@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,23 @@ _HEX_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LOCAL_CONTROL_HOSTS = frozenset(
     {"localhost", "127.0.0.1", "::1", "control-center", "testserver"}
+)
+_GENERIC_FAILURE_SUMMARY = "Worker reported a failure"
+_MAX_FAILURE_SUMMARY_LENGTH = 240
+_SENSITIVE_FAILURE_KEYS = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "prompt",
+        "traceback",
+        "stacktrace",
+        "exception",
+        "authorization",
+        "cookie",
+        "apikey",
+        "privatekey",
+    }
 )
 
 
@@ -201,6 +219,9 @@ class ControlPlaneClient:
         audio = Path(audio_path)
         if not audio.is_file():
             raise FileNotFoundError(audio)
+        payload = _json_compatible(metadata)
+        if isinstance(payload, Mapping):
+            _validate_upload_sha256(audio, payload)
         with audio.open("rb") as source:
             response = await self._request(
                 "POST",
@@ -208,7 +229,7 @@ class ControlPlaneClient:
                 files={"audio": (audio.name, source, "audio/wav")},
                 data={
                     "metadata": json.dumps(
-                        _json_compatible(metadata),
+                        payload,
                         ensure_ascii=False,
                         sort_keys=True,
                     )
@@ -221,7 +242,7 @@ class ControlPlaneClient:
         await self._request(
             "POST",
             f"/api/v1/workers/jobs/{_job_path_segment(job_id)}/failure",
-            json={"code": str(code), "message": str(message)},
+            json={"code": str(code), "message": _safe_failure_summary(message)},
             allow_statuses={204},
         )
 
@@ -470,6 +491,32 @@ def _json_body(response: httpx.Response) -> dict[str, Any]:
     except (ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _validate_upload_sha256(audio: Path, metadata: Mapping[str, Any]) -> None:
+    declared_sha256 = metadata.get("sha256")
+    if declared_sha256 is None:
+        return
+    if not isinstance(declared_sha256, str) or not _HEX_SHA256.fullmatch(declared_sha256):
+        raise ValueError("metadata sha256 must be a 64-character hexadecimal digest")
+    digest = hashlib.sha256()
+    with audio.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != declared_sha256.lower():
+        raise ValueError("metadata sha256 does not match audio")
+
+
+def _safe_failure_summary(message: Any) -> str:
+    normalized = str(message).strip()
+    key = re.sub(r"[^a-z0-9]", "", normalized.lower())
+    has_iso_control = any(
+        ord(character) < 32 or 127 <= ord(character) <= 159
+        for character in normalized
+    )
+    if has_iso_control or any(token in key for token in _SENSITIVE_FAILURE_KEYS):
+        return _GENERIC_FAILURE_SUMMARY
+    return normalized[:_MAX_FAILURE_SUMMARY_LENGTH]
 
 
 def _value(payload: Mapping[str, Any], *keys: str) -> Any:

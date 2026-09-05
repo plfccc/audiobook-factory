@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
@@ -216,7 +217,7 @@ def test_upload_result_sends_audio_and_metadata(tmp_path):
         client.upload_result(
             "job-1",
             audio,
-            {"sha256": "abc", "sizeBytes": 3},
+            {"sha256": hashlib.sha256(b"wav").hexdigest(), "sizeBytes": 3},
         )
     )
 
@@ -225,8 +226,52 @@ def test_upload_result_sends_audio_and_metadata(tmp_path):
         "https://factory.example/api/v1/workers/jobs/job-1/result"
     )
     assert b"result.wav" in request.content
-    assert b'"sha256": "abc"' in request.content
+    assert hashlib.sha256(b"wav").hexdigest().encode() in request.content
     assert b"wav" in request.content
+
+
+def test_upload_result_rejects_invalid_declared_sha_before_request(tmp_path):
+    transport = RecordingTransport([httpx.Response(204)])
+    client = make_client(transport)
+    audio = tmp_path / "result.wav"
+    audio.write_bytes(b"wav")
+
+    with pytest.raises(ValueError, match="sha256"):
+        run_async(client.upload_result("job-1", audio, {"sha256": "abc"}))
+
+    assert transport.requests == []
+
+
+def test_error_response_maps_legacy_worker_auth_code_to_waiting_state():
+    transport = RecordingTransport(
+        [httpx.Response(401, json={"code": "WORKER_UNAUTHORIZED", "message": "expired"})]
+    )
+    client = make_client(transport)
+
+    with pytest.raises(ControlPlaneError) as caught:
+        run_async(client.claim_job())
+
+    assert caught.value.code == "AUTH_REQUIRED"
+
+
+def test_report_failure_sends_only_a_safe_bounded_summary():
+    transport = RecordingTransport([httpx.Response(204)])
+    client = make_client(transport)
+
+    run_async(
+        client.report_failure(
+            "job-1",
+            "PERMANENT_FAILED",
+            "worker-token=worker-token clone_prompt=secret\nTraceback at com.example.Secret",
+        )
+    )
+
+    payload = json.loads(transport.requests[0].content)
+    assert len(payload["message"]) <= 240
+    assert "worker-token" not in payload["message"]
+    assert "clone_prompt" not in payload["message"]
+    assert "secret" not in payload["message"]
+    assert "Traceback" not in payload["message"]
 
 
 def test_report_failure_posts_code_and_message():

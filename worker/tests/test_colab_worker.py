@@ -19,6 +19,7 @@ from audiobook_worker.model_registry import ModelProfile
 from audiobook_worker.runtime_probe import RuntimeProbe
 from audiobook_worker.contracts import EngineCapabilities
 from audiobook_worker.server_client import ControlPlaneError
+from audiobook_worker.errors import ErrorCode, WorkerError
 
 
 def run_async(awaitable):
@@ -108,7 +109,7 @@ class FakeEngine:
         return GenerationResult(
             request_id=job.job_id,
             output_path=Path(destination),
-            sha256="abc",
+            sha256=hashlib.sha256(b"wav").hexdigest(),
             size_bytes=3,
             duration_seconds=1.0,
             sample_rate=24_000,
@@ -151,7 +152,7 @@ def test_run_once_registers_prepares_generates_and_uploads(tmp_path):
     assert engine.prepare_calls[0].profile_id == "voice-1"
     assert engine.synthesize_calls[0][0].job_id == "job-1"
     assert client.upload_calls[0][0] == "job-1"
-    assert client.upload_calls[0][2]["sha256"] == "abc"
+    assert client.upload_calls[0][2]["sha256"] == hashlib.sha256(b"wav").hexdigest()
     assert client.failure_calls == []
 
 
@@ -307,6 +308,57 @@ def test_generation_timeout_is_reported_and_not_uploaded(tmp_path):
     assert run_async(worker.run_once()) is False
     assert client.upload_calls == []
     assert client.failure_calls[0][1] == "GENERATION_TIMEOUT"
+
+
+def test_invalid_generation_sha_is_rejected_before_upload(tmp_path):
+    class InvalidShaEngine(FakeEngine):
+        async def synthesize(self, job, destination):
+            Path(destination).write_bytes(b"wav")
+            return GenerationResult(
+                request_id=job.job_id,
+                output_path=Path(destination),
+                sha256="not-a-sha256",
+                size_bytes=3,
+                duration_seconds=1.0,
+                sample_rate=24_000,
+                channels=1,
+            )
+
+    client = FakeClient(make_job(tmp_path))
+    worker = ColabWorker(
+        client=client,
+        engine=InvalidShaEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert client.upload_calls == []
+    assert client.failure_calls[0][1] == "INVALID_RESULT_SHA256"
+
+
+def test_provider_auth_failure_enters_waiting_state_instead_of_failed(tmp_path):
+    class AuthFailingEngine(FakeEngine):
+        async def synthesize(self, job, destination):
+            raise WorkerError(
+                ErrorCode.AUTH_REQUIRED,
+                "provider requires sign-in",
+                retryable=False,
+            )
+
+    client = FakeClient(make_job(tmp_path))
+    worker = ColabWorker(
+        client=client,
+        engine=AuthFailingEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert worker.state is WorkerState.AUTH_REQUIRED
+    assert client.failure_calls[0][1] == "AUTH_REQUIRED"
 
 
 def test_download_timeout_is_reported_before_synthesis(tmp_path):

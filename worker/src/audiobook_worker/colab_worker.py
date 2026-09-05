@@ -303,6 +303,7 @@ class ColabWorker:
             self._ensure_operation_allowed(operation_abort)
             metadata, output_path = _result_metadata(result, destination)
             output_path = _validate_output_path(output_path, self._output_root())
+            _validate_result_metadata(metadata, output_path)
             self.state = WorkerState.UPLOADING
             await self._run_guarded(
                 lambda: _call_async(
@@ -330,6 +331,20 @@ class ColabWorker:
             self._last_error = error
             self.state = WorkerState.BACKOFF
             raise
+        except WorkerError as error:
+            self._last_error = error
+            code = error.code.value
+            if code in _WAITING_CODES:
+                self._enter_protocol_wait(
+                    ControlPlaneError(
+                        str(error), code=code, retryable=error.retryable
+                    )
+                )
+                await self._report_failure(job.job_id, code, error)
+                return False
+            self.state = WorkerState.FAILED
+            await self._report_failure(job.job_id, code, error)
+            return False
         except ControlPlaneError as error:
             self._last_error = error
             if error.code in _WAITING_CODES:
@@ -714,6 +729,22 @@ def _result_metadata(result: Any, destination: Path) -> tuple[dict[str, Any], Pa
     if not output_path.is_file():
         raise ValueError("TTS engine did not return a readable output path")
     return {"sizeBytes": output_path.stat().st_size, "format": "wav"}, output_path
+
+
+def _validate_result_metadata(metadata: Mapping[str, Any], output_path: Path) -> None:
+    declared_sha256 = metadata.get("sha256")
+    if declared_sha256 is None:
+        return
+    if not isinstance(declared_sha256, str) or not _SHA256.fullmatch(declared_sha256):
+        raise _TaskFailure(
+            "INVALID_RESULT_SHA256",
+            "generated result must include a valid SHA256",
+        )
+    if _sha256_file(output_path) != declared_sha256.lower():
+        raise _TaskFailure(
+            "INVALID_RESULT_SHA256",
+            "generated result SHA256 does not match audio",
+        )
 
 
 def _failure_code(error: Exception) -> str:

@@ -109,7 +109,9 @@ public final class TextSegmenter {
             return;
         }
         int lastIndex = chunks.size() - 1;
-        if (codePointLength(chunks.get(lastIndex)) < policy.minChars()) {
+        if (codePointLength(chunks.get(lastIndex)) < policy.minChars()
+                && codePointLength(chunks.get(lastIndex - 1)) + codePointLength(chunks.get(lastIndex))
+                <= policy.maxChars()) {
             chunks.set(lastIndex - 1, chunks.get(lastIndex - 1) + chunks.get(lastIndex));
             chunks.remove(lastIndex);
         }
@@ -123,7 +125,7 @@ public final class TextSegmenter {
     }
 
     private void addUnit(List<String> units, String rawUnit) {
-        String unit = rawUnit.trim();
+        String unit = rawUnit.stripTrailing();
         if (!unit.isEmpty()) {
             units.add(unit);
         }

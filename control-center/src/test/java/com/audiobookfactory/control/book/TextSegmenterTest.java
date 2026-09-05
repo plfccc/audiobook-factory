@@ -58,4 +58,28 @@ class TextSegmenterTest {
         assertThat(segments).extracting(SegmentDraft::text)
                 .containsExactly("一二三四五六。七八九。");
     }
+
+    @Test
+    void doesNotMergeShortTrailingSegmentWhenTheMergeWouldExceedMaxChars() {
+        List<SegmentDraft> segments = segmenter.segment(
+                "一二三四五六七八九。十十一。",
+                new SegmentationPolicy(5, 8, 12, "v1"));
+
+        assertThat(segments).extracting(SegmentDraft::text)
+                .containsExactly("一二三四五六七八九。", "十十一。");
+    }
+
+    @Test
+    void preservesSpacesAfterEnglishPunctuationAcrossSegmentBoundaries() {
+        String chapterText = "Hello world, this is a sentence.";
+
+        List<SegmentDraft> segments = segmenter.segment(
+                chapterText,
+                new SegmentationPolicy(2, 12, 20, "v1"));
+
+        assertThat(segments).extracting(SegmentDraft::text)
+                .containsExactly("Hello world,", " this is a sentence.");
+        assertThat(String.join("", segments.stream().map(SegmentDraft::text).toList()))
+                .isEqualTo(chapterText);
+    }
 }

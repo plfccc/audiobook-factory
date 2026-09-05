@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <dc:title>测试有声书</dc:title>
+    </metadata>
+    <manifest>
+        <item id="second" href="text/second.xhtml" media-type="application/xhtml+xml"/>
+        <item id="first" href="text/first.xhtml" media-type="application/xhtml+xml"/>
+    </manifest>
+    <spine>
+        <itemref idref="first"/>
+        <itemref idref="second"/>
+    </spine>
+</package>

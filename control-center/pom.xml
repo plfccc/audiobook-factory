@@ -19,6 +19,7 @@
 
     <properties>
         <java.version>17</java.version>
+        <jsoup.version>1.19.1</jsoup.version>
         <testcontainers.version>1.21.3</testcontainers.version>
     </properties>
 
@@ -51,6 +52,11 @@
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>${jsoup.version}</version>
         </dependency>
 
         <dependency>

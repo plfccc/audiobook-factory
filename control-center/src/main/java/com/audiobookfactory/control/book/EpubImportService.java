@@ -137,6 +137,10 @@ public class EpubImportService {
     }
 
     public BookImportResult importBook(InputStream source, String originalFilename) {
+        return importBookDetailed(source, originalFilename).result();
+    }
+
+    public ImportOutcome importBookDetailed(InputStream source, String originalFilename) {
         validateUploadName(source, originalFilename);
         reconcileStaging();
 
@@ -148,7 +152,7 @@ public class EpubImportService {
                     new LimitedInputStream(source, importLimits.maxSourceBytes()));
             Optional<StoredBookVersion> existing = repository.findBySourceSha256(staged.sha256());
             if (existing.isPresent()) {
-                return toImportResult(existing.get());
+                return new ImportOutcome(toImportResult(existing.get()), false);
             }
 
             ImportWorkspace activeWorkspace = workspace;
@@ -160,7 +164,7 @@ public class EpubImportService {
                 abortWorkspace(activeWorkspace);
                 Optional<StoredBookVersion> winner = repository.findBySourceSha256(staged.sha256());
                 if (winner.isPresent()) {
-                    return toImportResult(winner.get());
+                    return new ImportOutcome(toImportResult(winner.get()), false);
                 }
                 throw exception;
             } catch (RuntimeException exception) {
@@ -177,7 +181,7 @@ public class EpubImportService {
                 throw new IllegalStateException(
                         "EPUB database commit succeeded but file promotion is incomplete", exception);
             }
-            return result;
+            return new ImportOutcome(result, true);
         } catch (IOException exception) {
             throw new IllegalStateException("Unable to stage EPUB upload", exception);
         } finally {
@@ -465,6 +469,13 @@ public class EpubImportService {
             int chapterCount,
             String sourceFilePath,
             String sourceSha256) {
+    }
+
+    public record ImportOutcome(BookImportResult result, boolean created) {
+
+        public ImportOutcome {
+            Objects.requireNonNull(result, "result must not be null");
+        }
     }
 
     public record StagedSource(Path path, String sha256) {

@@ -49,22 +49,3 @@ final class BookHashing {
         }
     }
 }
-
-final class EpubImportException extends IllegalArgumentException {
-
-    private final String code;
-
-    EpubImportException(String code, String message) {
-        super(message);
-        this.code = code;
-    }
-
-    EpubImportException(String code, String message, Throwable cause) {
-        super(message, cause);
-        this.code = code;
-    }
-
-    public String code() {
-        return code;
-    }
-}

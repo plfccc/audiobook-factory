@@ -16,6 +16,8 @@ import java.util.Objects;
 public class AccessTokenFilter extends OncePerRequestFilter {
 
     private static final String BEARER_PREFIX = "Bearer ";
+    private static final String WORKER_API_PREFIX = "/api/v1/workers/";
+    private static final String ASSET_API_PREFIX = "/api/v1/assets/";
     private final AppProperties appProperties;
 
     public AccessTokenFilter(AppProperties appProperties) {
@@ -50,6 +52,18 @@ public class AccessTokenFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        String requestUri = request.getRequestURI();
+        String contextPath = request.getContextPath();
+        if (contextPath != null && !contextPath.isBlank()
+                && requestUri.startsWith(contextPath)) {
+            requestUri = requestUri.substring(contextPath.length());
+        }
+        return requestUri.startsWith(WORKER_API_PREFIX)
+                || requestUri.startsWith(ASSET_API_PREFIX);
     }
 
     private void reject(HttpServletResponse response) {

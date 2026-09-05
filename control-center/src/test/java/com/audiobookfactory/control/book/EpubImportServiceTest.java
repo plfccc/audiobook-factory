@@ -69,6 +69,16 @@ class EpubImportServiceTest {
     }
 
     @Test
+    void reportsWhetherAnUploadCreatedANewBookVersion() throws Exception {
+        EpubImportService.ImportOutcome first = service.importBookDetailed(fixture(), "sample.epub");
+        EpubImportService.ImportOutcome duplicate = service.importBookDetailed(fixture(), "renamed.epub");
+
+        assertThat(first.created()).isTrue();
+        assertThat(duplicate.created()).isFalse();
+        assertThat(duplicate.result()).isEqualTo(first.result());
+    }
+
+    @Test
     void keepsParagraphBoundariesInExtractedChapterText() throws Exception {
         Path epub = writeZip(fixtureEntries());
 

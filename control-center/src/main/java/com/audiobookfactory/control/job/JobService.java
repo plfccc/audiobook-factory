@@ -1,0 +1,951 @@
+package com.audiobookfactory.control.job;
+
+import com.audiobookfactory.control.ApiException;
+import com.audiobookfactory.control.config.AppProperties;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.math.BigDecimal;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HexFormat;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+
+@Service
+public class JobService {
+
+    public static final String DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base";
+    public static final int DEFAULT_LEASE_SECONDS = JobClaimRepository.LEASE_SECONDS;
+
+    private static final long MAX_RESULT_BYTES = 512L * 1024 * 1024;
+    private static final Set<String> RETRYABLE_FAILURE_CODES = Set.of(
+            "GENERATION_TIMEOUT", "DOWNLOAD_TIMEOUT", "PAGE_NOT_READY", "TEMPORARY_FAILURE");
+    private static final Set<String> SENSITIVE_PRESET_KEYS = Set.of(
+            "cloneprompt", "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
+    private static final Set<String> LEASED_STATUSES = Set.of("LEASED", "GENERATING", "UPLOADING");
+    private static final List<TtsModelView> TTS_MODELS = List.of(
+            new TtsModelView(
+                    "qwen3-tts", DEFAULT_MODEL, "1.0", 8L * 1024 * 1024 * 1024, 500,
+                    new TtsCapabilities(List.of("zh-CN", "en-US"), false, true, false, false),
+                    "https://github.com/QwenLM/Qwen3-TTS/blob/main/LICENSE"),
+            new TtsModelView(
+                    "qwen3-tts", "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "1.0",
+                    4L * 1024 * 1024 * 1024, 400,
+                    new TtsCapabilities(List.of("zh-CN", "en-US"), false, true, false, false),
+                    "https://github.com/QwenLM/Qwen3-TTS/blob/main/LICENSE"),
+            new TtsModelView(
+                    "cosyvoice3", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512", "3.0",
+                    8L * 1024 * 1024 * 1024, 300,
+                    new TtsCapabilities(List.of("zh-CN", "en-US"), false, true, true, false),
+                    "https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE"),
+            new TtsModelView(
+                    "indextts-2.5", "IndexTeam/IndexTTS-2.5", "2.5",
+                    8L * 1024 * 1024 * 1024, 200,
+                    new TtsCapabilities(List.of("zh-CN", "en-US"), false, true, true, true),
+                    "https://github.com/index-tts/index-tts/blob/main/LICENSE"),
+            new TtsModelView(
+                    "f5-tts", "SWivid/F5-TTS", "1.0", 6L * 1024 * 1024 * 1024, 100,
+                    new TtsCapabilities(List.of("zh-CN", "en-US"), false, true, false, false),
+                    "https://github.com/SWivid/F5-TTS/blob/main/LICENSE"));
+    private static final RowMapper<BookRow> BOOK_ROW_MAPPER = (resultSet, rowNum) -> new BookRow(
+            resultSet.getLong("id"), resultSet.getString("status"));
+    private static final RowMapper<JobRow> JOB_ROW_MAPPER = (resultSet, rowNum) -> new JobRow(
+            resultSet.getLong("id"),
+            resultSet.getString("status"),
+            resultSet.getString("lease_owner"),
+            timestamp(resultSet.getTimestamp("lease_expires_at")),
+            resultSet.getLong("chapter_id"),
+            resultSet.getInt("chapter_number"),
+            resultSet.getLong("book_id"),
+            resultSet.getLong("book_version_id"),
+            resultSet.getInt("segment_index"),
+            resultSet.getString("error_code"),
+            resultSet.getString("error_message"),
+            resultSet.getString("result_idempotency_key"));
+
+    private final JdbcTemplate jdbcTemplate;
+    private final TransactionTemplate transactionTemplate;
+    private final ObjectMapper objectMapper;
+    private final Path storageRoot;
+
+    @Autowired
+    public JobService(JdbcTemplate jdbcTemplate,
+                      PlatformTransactionManager transactionManager,
+                      ObjectMapper objectMapper,
+                      AppProperties appProperties) {
+        this(jdbcTemplate, transactionManager, objectMapper, appProperties.storageRoot());
+    }
+
+    public JobService(JdbcTemplate jdbcTemplate,
+                      PlatformTransactionManager transactionManager,
+                      ObjectMapper objectMapper,
+                      Path storageRoot) {
+        this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
+        this.transactionTemplate = new TransactionTemplate(
+                Objects.requireNonNull(transactionManager, "transactionManager must not be null"));
+        this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
+        this.storageRoot = Objects.requireNonNull(storageRoot, "storageRoot must not be null")
+                .toAbsolutePath().normalize();
+    }
+
+    public JobBatch createPreview(long bookId, Map<String, Object> request) {
+        return createJobs(bookId, request, true);
+    }
+
+    public JobBatch createGeneration(long bookId, Map<String, Object> request) {
+        return createJobs(bookId, request, false);
+    }
+
+    public List<TtsModelView> listTtsModels() {
+        return TTS_MODELS;
+    }
+
+    public List<TtsPresetView> listTtsPresets() {
+        return jdbcTemplate.query("""
+                SELECT id, engine, model, model_version, style_instruction, speed,
+                       model_parameters::text AS model_parameters_json, segment_length
+                FROM tts_preset
+                ORDER BY id
+                """, (resultSet, rowNum) -> new TtsPresetView(
+                resultSet.getLong("id"),
+                resultSet.getString("engine"),
+                resultSet.getString("model"),
+                resultSet.getString("model_version"),
+                resultSet.getString("style_instruction"),
+                resultSet.getBigDecimal("speed"),
+                safeJsonObject(resultSet.getString("model_parameters_json")),
+                resultSet.getInt("segment_length")));
+    }
+
+    private JobBatch createJobs(long bookId, Map<String, Object> request, boolean preview) {
+        requirePositiveId(bookId, "bookId");
+        Map<String, Object> body = request == null ? Map.of() : request;
+        try {
+            JobBatch result = transactionTemplate.execute(status ->
+                    createJobsInTransaction(bookId, body, preview));
+            if (result == null) {
+                throw new IllegalStateException("job creation transaction returned no result");
+            }
+            return result;
+        } catch (DataIntegrityViolationException exception) {
+            throw new ApiException("ANOTHER_BOOK_RUNNING", 409,
+                    "Only one book may be running at a time");
+        }
+    }
+
+    private JobBatch createJobsInTransaction(long bookId, Map<String, Object> request, boolean preview) {
+        BookRow book = findBookForUpdate(bookId).orElseThrow(() ->
+                new ApiException("BOOK_NOT_FOUND", 404, "Book was not found"));
+        List<ChapterRef> chapters = findChapters(bookId);
+        if (chapters.isEmpty()) {
+            throw new ApiException("NO_CHAPTERS", 409, "Book has no chapters");
+        }
+
+        int defaultEnd = chapters.get(chapters.size() - 1).chapterNumber();
+        int start = readInt(request, 1,
+                "chapterNumber", "chapterIndex", "chapterStart", "fromChapter", "startChapter");
+        int end = preview
+                ? start
+                : readInt(request, defaultEnd, "chapterEnd", "toChapter", "endChapter");
+        if (start <= 0 || end < start) {
+            throw new ApiException("INVALID_CHAPTER_RANGE", 400, "Chapter range is invalid");
+        }
+        String presetSnapshot = presetSnapshot(request);
+        Integer requestedSegment = preview
+                ? optionalInt(request, "segmentIndex", "segmentNumber")
+                : null;
+
+        List<String> jobIds = new ArrayList<>();
+        for (ChapterRef chapter : chapters) {
+            if (chapter.chapterNumber() < start || chapter.chapterNumber() > end) {
+                continue;
+            }
+            List<Long> chapterJobs = findChapterJobs(chapter.id(), requestedSegment);
+            if (chapterJobs.isEmpty()) {
+                if (requestedSegment != null) {
+                    throw new ApiException("JOB_NOT_FOUND", 404, "Requested segment was not found");
+                }
+                continue;
+            }
+            for (Long jobId : chapterJobs) {
+                jdbcTemplate.update("""
+                        UPDATE generation_job
+                        SET status = CASE WHEN status = 'SUCCESS' THEN status ELSE 'WAITING' END,
+                            preset_snapshot = CASE WHEN status = 'SUCCESS'
+                                THEN preset_snapshot ELSE CAST(? AS jsonb) END,
+                            lease_owner = CASE WHEN status = 'SUCCESS' THEN lease_owner ELSE NULL END,
+                            lease_expires_at = CASE WHEN status = 'SUCCESS' THEN lease_expires_at ELSE NULL END,
+                            heartbeat_at = CASE WHEN status = 'SUCCESS' THEN heartbeat_at ELSE NULL END,
+                            error_code = CASE WHEN status = 'SUCCESS' THEN error_code ELSE NULL END,
+                            error_message = CASE WHEN status = 'SUCCESS' THEN error_message ELSE NULL END,
+                            next_retry_at = CASE WHEN status = 'SUCCESS' THEN next_retry_at ELSE NULL END,
+                            started_at = CASE WHEN status = 'SUCCESS' THEN started_at ELSE NULL END,
+                            finished_at = CASE WHEN status = 'SUCCESS' THEN finished_at ELSE NULL END,
+                            result_idempotency_key = CASE WHEN status = 'SUCCESS'
+                                THEN result_idempotency_key ELSE NULL END,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """, presetSnapshot, jobId);
+                jobIds.add(Long.toString(jobId));
+            }
+            jdbcTemplate.update("""
+                    UPDATE chapter
+                    SET status = CASE WHEN status = 'SUCCESS' THEN status ELSE 'WAITING' END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """, chapter.id());
+        }
+        if (jobIds.isEmpty()) {
+            throw new ApiException("NO_JOBS", 409, "No generation jobs matched the request");
+        }
+
+        jdbcTemplate.update("UPDATE book SET status = 'RUNNING', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                book.id());
+        return new JobBatch(book.id(), jobIds, start, end, preview ? "PREVIEW" : "GENERATION", "WAITING");
+    }
+
+    public void pauseBook(long bookId) {
+        changeBookStatus(bookId, Set.of("DRAFT", "RUNNING", "PAUSED"), "PAUSED", true);
+    }
+
+    public void resumeBook(long bookId) {
+        changeBookStatus(bookId, Set.of("PAUSED"), "RUNNING", false);
+    }
+
+    private void changeBookStatus(long bookId, Set<String> acceptedStatuses,
+                                  String targetStatus, boolean idempotentTarget) {
+        requirePositiveId(bookId, "bookId");
+        try {
+            Integer updated = transactionTemplate.execute(status -> {
+                Optional<BookRow> book = findBookForUpdate(bookId);
+                if (book.isEmpty()) {
+                    throw new ApiException("BOOK_NOT_FOUND", 404, "Book was not found");
+                }
+                if (idempotentTarget && targetStatus.equals(book.get().status())) {
+                    return 0;
+                }
+                if (!acceptedStatuses.contains(book.get().status())) {
+                    throw new ApiException("BOOK_STATE_CONFLICT", 409,
+                            "Book cannot transition from its current state");
+                }
+                return jdbcTemplate.update(
+                        "UPDATE book SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        targetStatus, bookId);
+            });
+            if (updated == null) {
+                throw new IllegalStateException("book status transaction returned no result");
+            }
+        } catch (DataIntegrityViolationException exception) {
+            throw new ApiException("ANOTHER_BOOK_RUNNING", 409,
+                    "Only one book may be running at a time");
+        }
+    }
+
+    public void heartbeat(long jobId, String workerId) {
+        requirePositiveId(jobId, "jobId");
+        String owner = requireWorkerId(workerId);
+        transactionTemplate.executeWithoutResult(status -> {
+            JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
+                    new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
+            ensureCurrentLease(job, owner);
+            Instant now = Instant.now();
+            jdbcTemplate.update("""
+                    UPDATE generation_job
+                    SET status = CASE WHEN status = 'LEASED' THEN 'GENERATING' ELSE status END,
+                        lease_expires_at = ?::timestamptz + interval '5 minutes',
+                        heartbeat_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """, Timestamp.from(now), Timestamp.from(now), Timestamp.from(now), jobId);
+            jdbcTemplate.update("""
+                    UPDATE worker_registration
+                    SET last_heartbeat_at = ?, updated_at = ?
+                    WHERE worker_id = ? AND status = 'ACTIVE'
+                    """, Timestamp.from(now), Timestamp.from(now), owner);
+        });
+    }
+
+    public void recordFailure(long jobId, String workerId, String code, String message) {
+        requirePositiveId(jobId, "jobId");
+        String owner = requireWorkerId(workerId);
+        String normalizedCode = normalizeFailureCode(code);
+        String normalizedMessage = normalizeFailureMessage(message);
+        transactionTemplate.executeWithoutResult(status -> {
+            JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
+                    new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
+            boolean sameReportedFailure = normalizedCode.equals(job.errorCode())
+                    && normalizedMessage.equals(job.errorMessage())
+                    && job.leaseOwner() == null
+                    && ("FAILED".equals(job.status()) || "WAITING".equals(job.status()));
+            if (sameReportedFailure) {
+                return;
+            }
+            if ("SUCCESS".equals(job.status())) {
+                throw new ApiException("JOB_ALREADY_COMPLETED", 409, "Job has already completed");
+            }
+            ensureCurrentLease(job, owner);
+            Instant now = Instant.now();
+            boolean retryable = RETRYABLE_FAILURE_CODES.contains(normalizedCode);
+            String nextRetryAt = retryable
+                    ? Timestamp.from(now.plusSeconds(retryDelaySeconds(1))).toString()
+                    : null;
+            String targetStatus = retryable ? "WAITING" : "FAILED";
+            jdbcTemplate.update("""
+                    UPDATE generation_job
+                    SET status = ?,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        heartbeat_at = NULL,
+                        error_code = ?,
+                        error_message = ?,
+                        next_retry_at = ?::timestamptz,
+                        finished_at = CASE WHEN ? = 'FAILED' THEN ? ELSE finished_at END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """, targetStatus, normalizedCode, normalizedMessage, nextRetryAt,
+                    targetStatus, Timestamp.from(now), Timestamp.from(now), jobId);
+            jdbcTemplate.update("""
+                    UPDATE chapter
+                    SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status <> 'SUCCESS'
+                    """, retryable ? "WAITING" : "FAILED", job.chapterId());
+        });
+    }
+
+    public void recordResult(long jobId, String workerId, MultipartFile audio, String metadataJson) {
+        requirePositiveId(jobId, "jobId");
+        String owner = requireWorkerId(workerId);
+        if (audio == null || audio.isEmpty()) {
+            throw new ApiException("INVALID_RESULT", 400, "Result audio must not be empty");
+        }
+        ParsedResultMetadata declaredMetadata = parseResultMetadata(metadataJson);
+        StagedResult staged = stageResult(audio);
+        ResultTarget target = new ResultTarget();
+        try {
+            ParsedResultMetadata metadata = validateResultMetadata(
+                    declaredMetadata, staged.sha256(), staged.sizeBytes());
+            transactionTemplate.executeWithoutResult(status ->
+                    persistResult(jobId, owner, staged.path(), metadata, target));
+        } finally {
+            deleteQuietly(staged.path());
+            if (target.moved() && !target.committed()) {
+                deleteQuietly(target.finalPath());
+            }
+        }
+    }
+
+    public void completeChapterAfterMerge(long chapterId, String finalAudioPath) {
+        requirePositiveId(chapterId, "chapterId");
+        Path finalPath = safeStoragePath(finalAudioPath);
+        if (!Files.isRegularFile(finalPath, LinkOption.NOFOLLOW_LINKS)) {
+            throw new ApiException("CHAPTER_AUDIO_NOT_FOUND", 409, "Merged chapter audio is not ready");
+        }
+        transactionTemplate.executeWithoutResult(status -> {
+            Boolean chapterExists = jdbcTemplate.queryForObject(
+                    "SELECT EXISTS (SELECT 1 FROM chapter WHERE id = ?)", Boolean.class, chapterId);
+            if (!Boolean.TRUE.equals(chapterExists)) {
+                throw new ApiException("CHAPTER_NOT_FOUND", 404, "Chapter was not found");
+            }
+            Boolean allSuccessful = jdbcTemplate.queryForObject("""
+                    SELECT NOT EXISTS (
+                        SELECT 1 FROM generation_job
+                        WHERE chapter_id = ? AND status <> 'SUCCESS'
+                    )
+                    """, Boolean.class, chapterId);
+            if (!Boolean.TRUE.equals(allSuccessful)) {
+                throw new ApiException("CHAPTER_NOT_READY", 409, "Chapter still has unfinished jobs");
+            }
+            jdbcTemplate.update("""
+                    UPDATE chapter
+                    SET status = 'SUCCESS', final_audio_path = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """, finalPath.toString(), chapterId);
+        });
+    }
+
+    public JsonNode workerPreset(String presetSnapshot) {
+        if (presetSnapshot == null || presetSnapshot.isBlank()) {
+            return objectMapper.createObjectNode();
+        }
+        try {
+            JsonNode parsed = objectMapper.readTree(presetSnapshot);
+            if (parsed == null || !parsed.isObject()) {
+                return objectMapper.createObjectNode();
+            }
+            return sanitizeJson(parsed);
+        } catch (JsonProcessingException exception) {
+            return objectMapper.createObjectNode();
+        }
+    }
+
+    private void persistResult(long jobId, String workerId, Path stagedPath,
+                               ParsedResultMetadata metadata, ResultTarget target) {
+        JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
+                new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
+        if ("SUCCESS".equals(job.status())) {
+            if (metadata.idempotencyKey().equals(job.resultIdempotencyKey())) {
+                return;
+            }
+            throw new ApiException("RESULT_IDEMPOTENCY_CONFLICT", 409,
+                    "A different result was already recorded for this job");
+        }
+        ensureCurrentLease(job, workerId);
+        Path finalPath = resultPath(job);
+        try {
+            Files.createDirectories(finalPath.getParent());
+            moveWithoutOverwrite(stagedPath, finalPath);
+            target.moved(finalPath);
+        } catch (IOException exception) {
+            throw new ApiException("RESULT_STORAGE_FAILED", 500, "Unable to store result audio");
+        }
+
+        Instant now = Instant.now();
+        int updated = jdbcTemplate.update("""
+                UPDATE generation_job
+                SET status = 'SUCCESS',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    heartbeat_at = NULL,
+                    error_code = NULL,
+                    error_message = NULL,
+                    next_retry_at = NULL,
+                    finished_at = ?,
+                    result_idempotency_key = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """, Timestamp.from(now), metadata.idempotencyKey(), Timestamp.from(now), jobId);
+        if (updated != 1) {
+            throw new ApiException("RESULT_CONFLICT", 409, "Job result could not be recorded");
+        }
+        jdbcTemplate.update("""
+                INSERT INTO audio_asset (job_id, file_path, format, duration_ms, sample_rate,
+                                         channels, size_bytes, sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, jobId, finalPath.toString(), metadata.format(), metadata.durationMs(),
+                metadata.sampleRate(), metadata.channels(), metadata.actualSizeBytes(), metadata.actualSha256());
+        target.markCommitted();
+    }
+
+    private StagedResult stageResult(MultipartFile audio) {
+        Path directory = storageRoot.resolve(".staging").resolve("results").normalize();
+        if (!directory.startsWith(storageRoot)) {
+            throw new ApiException("INVALID_RESULT", 400, "Result storage path is invalid");
+        }
+        Path target = directory.resolve(UUID.randomUUID() + ".upload");
+        MessageDigest digest = sha256Digest();
+        long size = 0;
+        try {
+            Files.createDirectories(directory);
+            try (InputStream input = audio.getInputStream();
+                 OutputStream output = Files.newOutputStream(target, StandardOpenOption.CREATE_NEW,
+                         StandardOpenOption.WRITE)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    size += read;
+                    if (size > MAX_RESULT_BYTES) {
+                        throw new ApiException("INVALID_RESULT", 400, "Result audio is too large");
+                    }
+                    digest.update(buffer, 0, read);
+                    output.write(buffer, 0, read);
+                }
+            }
+            return new StagedResult(target, HexFormat.of().formatHex(digest.digest()), size);
+        } catch (ApiException exception) {
+            deleteQuietly(target);
+            throw exception;
+        } catch (IOException exception) {
+            deleteQuietly(target);
+            throw new ApiException("INVALID_RESULT", 400, "Unable to read result audio");
+        }
+    }
+
+    private ParsedResultMetadata parseResultMetadata(String metadataJson) {
+        JsonNode metadata;
+        try {
+            metadata = metadataJson == null || metadataJson.isBlank()
+                    ? objectMapper.createObjectNode()
+                    : objectMapper.readTree(metadataJson);
+        } catch (JsonProcessingException exception) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        if (metadata == null || !metadata.isObject()) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        String declaredSha256 = text(metadata, "sha256");
+        if (declaredSha256 != null && declaredSha256.length() > 64) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        Long declaredSizeBytes = longValue(metadata, "sizeBytes", "size_bytes");
+        if (declaredSizeBytes != null && declaredSizeBytes < 0) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        String format = text(metadata, "format", "outputFormat", "output_format");
+        format = format == null ? "wav" : format.toLowerCase(Locale.ROOT);
+        if (!format.matches("[a-z0-9]{1,16}")) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        Long durationMs = longValue(metadata, "durationMs", "duration_ms");
+        Integer sampleRate = intValue(metadata, "sampleRate", "sample_rate");
+        Integer channels = intValue(metadata, "channels");
+        if ((durationMs != null && durationMs < 0)
+                || (sampleRate != null && sampleRate <= 0)
+                || (channels != null && channels <= 0)) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        String idempotencyKey = text(metadata, "idempotencyKey", "idempotency_key");
+        if (idempotencyKey != null && idempotencyKey.length() > 256) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        return new ParsedResultMetadata(declaredSha256, declaredSizeBytes, format, durationMs,
+                sampleRate, channels, idempotencyKey, null, null);
+    }
+
+    private ParsedResultMetadata validateResultMetadata(ParsedResultMetadata metadata,
+                                                          String actualSha256, long actualSize) {
+        if (metadata.declaredSha256() != null
+                && metadata.declaredSha256().matches("[0-9a-fA-F]{64}")
+                && !metadata.declaredSha256().equalsIgnoreCase(actualSha256)) {
+            throw new ApiException("INVALID_RESULT", 400, "Result SHA-256 does not match audio");
+        }
+        if (metadata.declaredSizeBytes() != null && metadata.declaredSizeBytes() != actualSize) {
+            throw new ApiException("INVALID_RESULT", 400, "Result size does not match audio");
+        }
+        String idempotencyKey = metadata.idempotencyKey();
+        if (idempotencyKey == null) {
+            idempotencyKey = (metadata.declaredSha256() == null
+                    ? actualSha256 : metadata.declaredSha256()) + ":" + actualSize;
+        }
+        if (idempotencyKey.isBlank() || idempotencyKey.length() > 256) {
+            throw new ApiException("INVALID_RESULT", 400, "Result idempotency key is invalid");
+        }
+        return metadata.withActual(actualSha256, actualSize).withIdempotencyKey(idempotencyKey);
+    }
+
+    private Optional<BookRow> findBookForUpdate(long bookId) {
+        List<BookRow> books = jdbcTemplate.query(
+                "SELECT id, status FROM book WHERE id = ? FOR UPDATE", BOOK_ROW_MAPPER, bookId);
+        return books.stream().findFirst();
+    }
+
+    private List<ChapterRef> findChapters(long bookId) {
+        return jdbcTemplate.query("""
+                SELECT c.id, c.chapter_number
+                FROM chapter c
+                JOIN book_version bv ON bv.id = c.book_version_id
+                WHERE bv.book_id = ?
+                  AND bv.id = (
+                      SELECT latest.id FROM book_version latest
+                      WHERE latest.book_id = bv.book_id
+                      ORDER BY latest.id DESC LIMIT 1
+                  )
+                ORDER BY c.chapter_number
+                """, (resultSet, rowNum) -> new ChapterRef(
+                resultSet.getLong("id"), resultSet.getInt("chapter_number")), bookId);
+    }
+
+    private List<Long> findChapterJobs(long chapterId, Integer segmentIndex) {
+        if (segmentIndex == null) {
+            return jdbcTemplate.query("""
+                    SELECT id FROM generation_job
+                    WHERE chapter_id = ?
+                    ORDER BY segment_index, id
+                    """, (resultSet, rowNum) -> resultSet.getLong("id"), chapterId);
+        }
+        return jdbcTemplate.query("""
+                SELECT id FROM generation_job
+                WHERE chapter_id = ? AND segment_index = ?
+                ORDER BY id
+                """, (resultSet, rowNum) -> resultSet.getLong("id"), chapterId, segmentIndex);
+    }
+
+    private Optional<JobRow> findJobForUpdate(long jobId) {
+        List<JobRow> jobs = jdbcTemplate.query("""
+                SELECT gj.id, gj.status, gj.lease_owner, gj.lease_expires_at,
+                       gj.chapter_id, c.chapter_number, bv.book_id, bv.id AS book_version_id,
+                       gj.segment_index, gj.error_code, gj.error_message, gj.result_idempotency_key
+                FROM generation_job gj
+                JOIN chapter c ON c.id = gj.chapter_id
+                JOIN book_version bv ON bv.id = c.book_version_id
+                WHERE gj.id = ?
+                FOR UPDATE OF gj
+                """, JOB_ROW_MAPPER, jobId);
+        return jobs.stream().findFirst();
+    }
+
+    private Path resultPath(JobRow job) {
+        Path path = storageRoot.resolve("books")
+                .resolve(Long.toString(job.bookId()))
+                .resolve("versions")
+                .resolve(Long.toString(job.bookVersionId()))
+                .resolve("chapters")
+                .resolve(Integer.toString(job.chapterNumber()))
+                .resolve("segments")
+                .resolve(Integer.toString(job.segmentIndex()) + ".wav")
+                .normalize();
+        if (!path.startsWith(storageRoot)) {
+            throw new ApiException("RESULT_STORAGE_FAILED", 500, "Result storage path is invalid");
+        }
+        return path;
+    }
+
+    private void ensureCurrentLease(JobRow job, String workerId) {
+        if (!workerId.equals(job.leaseOwner())
+                || !LEASED_STATUSES.contains(job.status())
+                || job.leaseExpiresAt() == null
+                || !job.leaseExpiresAt().isAfter(Instant.now())) {
+            throw leaseLost();
+        }
+    }
+
+    private ApiException leaseLost() {
+        return new ApiException("LEASE_LOST", 409, "Worker lease is no longer valid");
+    }
+
+    private String presetSnapshot(Map<String, Object> request) {
+        Object preset = request.get("preset");
+        if (preset != null && !(preset instanceof Map<?, ?>)) {
+            throw new ApiException("INVALID_PRESET", 400, "Preset must be an object");
+        }
+        Object source = preset == null ? request : preset;
+        try {
+            JsonNode node = objectMapper.valueToTree(source);
+            JsonNode sanitized = sanitizeJson(node);
+            if (!sanitized.isObject()) {
+                throw new ApiException("INVALID_PRESET", 400, "Preset must be an object");
+            }
+            return objectMapper.writeValueAsString(sanitized);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (IllegalArgumentException | JsonProcessingException exception) {
+            throw new ApiException("INVALID_PRESET", 400, "Preset is invalid");
+        }
+    }
+
+    private JsonNode sanitizeJson(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return objectMapper.nullNode();
+        }
+        if (node.isObject()) {
+            ObjectNode clean = objectMapper.createObjectNode();
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                if (SENSITIVE_PRESET_KEYS.contains(normalizeKey(field.getKey()))) {
+                    continue;
+                }
+                clean.set(field.getKey(), sanitizeJson(field.getValue()));
+            }
+            return clean;
+        }
+        if (node.isArray()) {
+            ArrayNode clean = objectMapper.createArrayNode();
+            for (JsonNode child : node) {
+                clean.add(sanitizeJson(child));
+            }
+            return clean;
+        }
+        return node.deepCopy();
+    }
+
+    private JsonNode safeJsonObject(String json) {
+        if (json == null || json.isBlank()) {
+            return objectMapper.createObjectNode();
+        }
+        try {
+            JsonNode parsed = objectMapper.readTree(json);
+            if (parsed == null || !parsed.isObject()) {
+                return objectMapper.createObjectNode();
+            }
+            JsonNode sanitized = sanitizeJson(parsed);
+            return sanitized.isObject() ? sanitized : objectMapper.createObjectNode();
+        } catch (JsonProcessingException exception) {
+            return objectMapper.createObjectNode();
+        }
+    }
+
+    private String normalizeKey(String key) {
+        return key == null ? "" : key.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+    }
+
+    private String normalizeFailureCode(String code) {
+        if (code == null || !code.matches("[A-Za-z0-9_.-]{1,128}")) {
+            throw new ApiException("INVALID_FAILURE", 400, "Failure code is invalid");
+        }
+        return code.toUpperCase(Locale.ROOT);
+    }
+
+    private String normalizeFailureMessage(String message) {
+        if (message == null || message.isBlank()) {
+            throw new ApiException("INVALID_FAILURE", 400, "Failure message is invalid");
+        }
+        String normalized = message.trim();
+        if (normalized.length() > 2000) {
+            normalized = normalized.substring(0, 2000);
+        }
+        String key = normalizeKey(normalized);
+        if (key.contains("cloneprompt") || key.contains("workertoken")
+                || key.contains("enrollmenttoken") || key.contains("accesstoken")) {
+            return "Worker reported a failure";
+        }
+        return normalized;
+    }
+
+    private int readInt(Map<String, Object> request, int defaultValue, String... keys) {
+        for (String key : keys) {
+            if (request.containsKey(key) && request.get(key) != null) {
+                return parseInt(request.get(key));
+            }
+        }
+        return defaultValue;
+    }
+
+    private Integer optionalInt(Map<String, Object> request, String... keys) {
+        for (String key : keys) {
+            if (request.containsKey(key) && request.get(key) != null) {
+                int value = parseInt(request.get(key));
+                if (value <= 0) {
+                    throw new ApiException("INVALID_REQUEST", 400, "Request value is invalid");
+                }
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private int parseInt(Object value) {
+        try {
+            if (value instanceof Number number) {
+                return new BigDecimal(number.toString()).intValueExact();
+            }
+            return Integer.parseInt(String.valueOf(value));
+        } catch (ArithmeticException | NumberFormatException exception) {
+            throw new ApiException("INVALID_REQUEST", 400, "Request value is invalid");
+        }
+    }
+
+    private String requireWorkerId(String workerId) {
+        if (workerId == null || workerId.isBlank() || workerId.length() > 128) {
+            throw new ApiException("WORKER_UNAUTHORIZED", 401, "Worker authorization is required");
+        }
+        return workerId.trim();
+    }
+
+    private void requirePositiveId(long id, String name) {
+        if (id <= 0) {
+            throw new ApiException("INVALID_ID", 400, name + " must be positive");
+        }
+    }
+
+    private long retryDelaySeconds(int attempts) {
+        return 15L * (1L << Math.min(Math.max(attempts - 1, 0), 2));
+    }
+
+    private static String text(JsonNode node, String... names) {
+        for (String name : names) {
+            JsonNode value = node.get(name);
+            if (value != null && value.isValueNode() && !value.isNull()) {
+                String text = value.asText();
+                if (!text.isBlank()) {
+                    return text.trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Long longValue(JsonNode node, String... names) {
+        String value = text(node, names);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException exception) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+    }
+
+    private static Integer intValue(JsonNode node, String... names) {
+        Long value = longValue(node, names);
+        if (value == null) {
+            return null;
+        }
+        if (value > Integer.MAX_VALUE || value < Integer.MIN_VALUE) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        return value.intValue();
+    }
+
+    private Path safeStoragePath(String value) {
+        if (value == null || value.isBlank()) {
+            throw new ApiException("INVALID_PATH", 400, "Storage path is invalid");
+        }
+        Path candidate;
+        try {
+            candidate = Path.of(value);
+        } catch (RuntimeException exception) {
+            throw new ApiException("INVALID_PATH", 400, "Storage path is invalid");
+        }
+        Path normalized = candidate.isAbsolute()
+                ? candidate.normalize() : storageRoot.resolve(candidate).normalize();
+        if (!normalized.startsWith(storageRoot)) {
+            throw new ApiException("INVALID_PATH", 400, "Storage path is invalid");
+        }
+        return normalized;
+    }
+
+    private static Instant timestamp(Timestamp value) {
+        return value == null ? null : value.toInstant();
+    }
+
+    private static MessageDigest sha256Digest() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 is not available", exception);
+        }
+    }
+
+    private static void moveWithoutOverwrite(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException exception) {
+            Files.move(source, target);
+        }
+    }
+
+    private static void deleteQuietly(Path path) {
+        if (path == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // 清理失败不覆盖原始业务错误。
+        }
+    }
+
+    private record BookRow(long id, String status) {
+    }
+
+    private record ChapterRef(long id, int chapterNumber) {
+    }
+
+    private record JobRow(long id, String status, String leaseOwner, Instant leaseExpiresAt,
+                          long chapterId, int chapterNumber, long bookId, long bookVersionId,
+                          int segmentIndex, String errorCode, String errorMessage,
+                          String resultIdempotencyKey) {
+    }
+
+    private record StagedResult(Path path, String sha256, long sizeBytes) {
+    }
+
+    private record ParsedResultMetadata(String declaredSha256, Long declaredSizeBytes,
+                                        String format, Long durationMs, Integer sampleRate,
+                                        Integer channels, String idempotencyKey,
+                                        String actualSha256, Long actualSizeBytes) {
+
+        private ParsedResultMetadata withActual(String sha256, long sizeBytes) {
+            return new ParsedResultMetadata(declaredSha256, declaredSizeBytes, format, durationMs,
+                    sampleRate, channels, idempotencyKey, sha256, sizeBytes);
+        }
+
+        private ParsedResultMetadata withIdempotencyKey(String key) {
+            return new ParsedResultMetadata(declaredSha256, declaredSizeBytes, format, durationMs,
+                    sampleRate, channels, key, actualSha256, actualSizeBytes);
+        }
+    }
+
+    private static final class ResultTarget {
+
+        private Path finalPath;
+        private boolean moved;
+        private boolean committed;
+
+        private void moved(Path finalPath) {
+            this.finalPath = finalPath;
+            this.moved = true;
+        }
+
+        private void markCommitted() {
+            this.committed = true;
+        }
+
+        private Path finalPath() {
+            return finalPath;
+        }
+
+        private boolean moved() {
+            return moved;
+        }
+
+        private boolean committed() {
+            return committed;
+        }
+    }
+
+    public record JobBatch(long bookId, List<String> jobIds, int chapterStart, int chapterEnd,
+                           String type, String status) {
+    }
+
+    public record TtsModelView(
+            String engineId,
+            String modelId,
+            String modelVersion,
+            long minimumVramBytes,
+            int priority,
+            TtsCapabilities capabilities,
+            String licenseUrl) {
+    }
+
+    public record TtsCapabilities(
+            List<String> languages,
+            boolean voiceDesign,
+            boolean voiceClone,
+            boolean emotionControl,
+            boolean durationControl) {
+    }
+
+    public record TtsPresetView(
+            long id,
+            String engine,
+            String model,
+            String modelVersion,
+            String styleInstruction,
+            BigDecimal speed,
+            JsonNode modelParameters,
+            int segmentLength) {
+    }
+}

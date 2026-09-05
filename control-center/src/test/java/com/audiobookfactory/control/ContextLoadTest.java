@@ -90,7 +90,8 @@ class ContextLoadTest {
         assertThat(columnsFor("generation_job"))
                 .containsExactlyInAnyOrder("id", "chapter_id", "segment_index", "segment_text", "text_sha256",
                         "preset_snapshot", "status", "lease_owner", "lease_expires_at", "error_code",
-                        "error_message", "created_at", "updated_at");
+                        "error_message", "heartbeat_at", "attempts", "next_retry_at", "started_at",
+                        "finished_at", "result_idempotency_key", "created_at", "updated_at");
         assertThat(columnsFor("audio_asset"))
                 .containsExactlyInAnyOrder("id", "job_id", "file_path", "format", "duration_ms", "sample_rate",
                         "channels", "size_bytes", "sha256", "created_at");
@@ -111,6 +112,7 @@ class ContextLoadTest {
                 "idx_chapter_status",
                 "idx_generation_job_status_lease",
                 "idx_generation_job_chapter_id",
+                "idx_generation_job_claim",
                 "idx_audio_asset_job_id",
                 "idx_worker_registration_status");
 
@@ -122,6 +124,8 @@ class ContextLoadTest {
         assertThat(indexDefinitions.get("idx_generation_job_status_lease"))
                 .contains("(status, lease_expires_at)");
         assertThat(indexDefinitions.get("idx_generation_job_chapter_id")).contains("(chapter_id)");
+        assertThat(indexDefinitions.get("idx_generation_job_claim"))
+                .contains("(status, next_retry_at, chapter_id, segment_index)");
         assertThat(indexDefinitions.get("idx_audio_asset_job_id")).contains("(job_id)");
         assertThat(indexDefinitions.get("idx_worker_registration_status")).contains("(status)");
     }

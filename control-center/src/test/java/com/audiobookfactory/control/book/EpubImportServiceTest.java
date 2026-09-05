@@ -1,6 +1,7 @@
 package com.audiobookfactory.control.book;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -9,6 +10,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -20,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -265,6 +268,177 @@ class EpubImportServiceTest {
 
         assertThat(Files.exists(staged.path())).isTrue();
         assertThat(Files.exists(workspaceDirectory)).isTrue();
+    }
+
+    @Test
+    void upgradesLegacyV1JournalWithoutFileMetadataDuringReconciliation() throws Exception {
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        PreparedImport prepared = prepareCommittedImport(fileStorage);
+        prepared.workspace().close();
+
+        Path journalPath = prepared.workspaceDirectory().resolve("journal.properties");
+        Properties journal = readProperties(journalPath);
+        journal.setProperty("formatVersion", "1");
+        int mappingCount = Integer.parseInt(journal.getProperty("mapping.count"));
+        for (int index = 0; index < mappingCount; index++) {
+            journal.remove("mapping." + index + ".size");
+            journal.remove("mapping." + index + ".sha256");
+        }
+        writeProperties(journalPath, journal);
+
+        new EpubImportService(repository, new EpubImportService.FileBookStorage(storageRoot))
+                .reconcileStaging();
+
+        assertThat(Files.exists(Path.of(prepared.sourcePath()))).isTrue();
+        assertThat(Files.readString(Path.of(prepared.chapterPath())))
+                .isEqualTo("recovered chapter");
+        assertThat(Files.exists(prepared.workspaceDirectory())).isFalse();
+    }
+
+    @Test
+    void recoversAfterCommitJournalReplacementFailureOnRestart() throws Exception {
+        EpubImportService.AtomicFileOperations operations = new EpubImportService.AtomicFileOperations() {
+            private int replacements;
+
+            @Override
+            public void moveAtomically(Path source, Path target) throws IOException {
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+            }
+
+            @Override
+            public void replaceAtomically(Path source, Path target) throws IOException {
+                replacements++;
+                if (replacements > 5) {
+                    throw new AtomicMoveNotSupportedException(
+                            source.toString(), target.toString(),
+                            "simulated post-commit journal replacement failure");
+                }
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+        };
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(
+                storageRoot, operations);
+        byte[] sourceBytes = fixtureBytes();
+        String sourceSha256 = sha256(sourceBytes);
+        EpubImportService.ImportWorkspace workspace = fileStorage.beginImport();
+        EpubImportService.StagedSource staged = workspace.stage(new ByteArrayInputStream(sourceBytes));
+        String sourcePath = workspace.storeSource(staged.path(), "sample.epub", sourceSha256);
+        String chapterPath = workspace.storeChapterText(7, 8, 1, "recovered chapter");
+        workspace.recordBookVersion(7, 8);
+        repository.recordCommittedVersion(new EpubImportService.StoredBookVersion(
+                7, 8, 1, sourcePath, sourceSha256));
+
+        assertThatThrownBy(workspace::databaseCommitted)
+                .isInstanceOfSatisfying(EpubImportException.class,
+                        exception -> assertThat(exception.code())
+                                .isEqualTo(EpubImportService.EPUB_IMPORT_RECOVERY_UNAVAILABLE));
+        assertThat(readProperties(onlyStagingWorkspace().resolve("journal.properties"))
+                .getProperty("formatVersion")).isEqualTo("2");
+        workspace.close();
+
+        new EpubImportService(repository, new EpubImportService.FileBookStorage(storageRoot))
+                .reconcileStaging();
+
+        assertThat(Files.exists(Path.of(sourcePath))).isTrue();
+        assertThat(Files.readString(Path.of(chapterPath)))
+                .isEqualTo("recovered chapter");
+        try (Stream<Path> files = Files.list(storageRoot.resolve("staging"))) {
+            assertThat(files.filter(Files::isDirectory).toList()).isEmpty();
+        }
+    }
+
+    @Test
+    void neverPromotesAnAbortedImportEvenWhenDatabaseMetadataMatches() throws Exception {
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        PreparedImport prepared = prepareCommittedImport(fileStorage);
+        prepared.workspace().close();
+
+        Path journalPath = prepared.workspaceDirectory().resolve("journal.properties");
+        Properties journal = readProperties(journalPath);
+        journal.setProperty("state", "ABORTED");
+        writeProperties(journalPath, journal);
+
+        assertThatThrownBy(() -> new EpubImportService(repository,
+                new EpubImportService.FileBookStorage(storageRoot)).reconcileStaging())
+                .isInstanceOfSatisfying(EpubImportException.class,
+                        exception -> assertThat(exception.code())
+                                .isEqualTo(EpubImportService.EPUB_IMPORT_RECOVERY_FAILED));
+
+        assertThat(Files.exists(Path.of(prepared.sourcePath()))).isFalse();
+        assertThat(Files.exists(Path.of(prepared.chapterPath()))).isFalse();
+        assertThat(Files.exists(prepared.sourceStagingPath())).isTrue();
+        assertThat(Files.exists(prepared.chapterStagingPath())).isTrue();
+        assertThat(Files.exists(prepared.workspaceDirectory())).isTrue();
+    }
+
+    @Test
+    void refusesFinalFileThatIsARegularFileSymlink() throws Exception {
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        PreparedImport prepared = prepareCommittedImport(fileStorage);
+        prepared.workspace().promote();
+        prepared.workspace().close();
+
+        Path finalPath = Path.of(prepared.chapterPath());
+        Path symlinkTarget = storageRoot.resolve("symlink-target.txt");
+        Files.writeString(symlinkTarget, "recovered chapter", StandardCharsets.UTF_8);
+        Files.delete(finalPath);
+        try {
+            Files.createSymbolicLink(finalPath, symlinkTarget);
+        } catch (UnsupportedOperationException | IOException | SecurityException exception) {
+            Assumptions.assumeTrue(false,
+                    "symbolic links are unavailable in this test environment: " + exception.getMessage());
+        }
+
+        assertThatThrownBy(() -> new EpubImportService(repository,
+                new EpubImportService.FileBookStorage(storageRoot)).reconcileStaging())
+                .isInstanceOfSatisfying(EpubImportException.class,
+                        exception -> assertThat(exception.code())
+                                .isEqualTo(EpubImportService.EPUB_IMPORT_RECOVERY_FAILED));
+        assertThat(Files.isSymbolicLink(finalPath)).isTrue();
+        assertThat(Files.exists(prepared.workspaceDirectory())).isTrue();
+    }
+
+    @Test
+    void refusesFinalDirectoryDuringReconciliation() throws Exception {
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        PreparedImport prepared = prepareCommittedImport(fileStorage);
+        prepared.workspace().promote();
+        prepared.workspace().close();
+
+        Path finalPath = Path.of(prepared.chapterPath());
+        Files.delete(finalPath);
+        Files.createDirectory(finalPath);
+
+        assertThatThrownBy(() -> new EpubImportService(repository,
+                new EpubImportService.FileBookStorage(storageRoot)).reconcileStaging())
+                .isInstanceOfSatisfying(EpubImportException.class,
+                        exception -> assertThat(exception.code())
+                                .isEqualTo(EpubImportService.EPUB_IMPORT_RECOVERY_FAILED));
+        assertThat(Files.isDirectory(finalPath)).isTrue();
+        assertThat(Files.exists(prepared.workspaceDirectory())).isTrue();
+    }
+
+    @Test
+    void refusesSameSizeFinalContentTamperingDuringReconciliation() throws Exception {
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        PreparedImport prepared = prepareCommittedImport(fileStorage);
+        prepared.workspace().promote();
+        prepared.workspace().close();
+
+        Path finalPath = Path.of(prepared.chapterPath());
+        Files.writeString(finalPath, "corrupted chapter", StandardCharsets.UTF_8,
+                java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+        assertThat(Files.size(finalPath))
+                .isEqualTo("recovered chapter".getBytes(StandardCharsets.UTF_8).length);
+
+        assertThatThrownBy(() -> new EpubImportService(repository,
+                new EpubImportService.FileBookStorage(storageRoot)).reconcileStaging())
+                .isInstanceOfSatisfying(EpubImportException.class,
+                        exception -> assertThat(exception.code())
+                                .isEqualTo(EpubImportService.EPUB_IMPORT_RECOVERY_FAILED));
+        assertThat(Files.readString(finalPath)).isEqualTo("corrupted chapter");
+        assertThat(Files.exists(prepared.workspaceDirectory())).isTrue();
     }
 
     @Test
@@ -551,10 +725,49 @@ class EpubImportServiceTest {
         return output.toByteArray();
     }
 
+    private PreparedImport prepareCommittedImport(EpubImportService.FileBookStorage fileStorage)
+            throws Exception {
+        byte[] sourceBytes = fixtureBytes();
+        String sourceSha256 = sha256(sourceBytes);
+        EpubImportService.ImportWorkspace workspace = fileStorage.beginImport();
+        EpubImportService.StagedSource staged = workspace.stage(new ByteArrayInputStream(sourceBytes));
+        String sourcePath = workspace.storeSource(staged.path(), "sample.epub", sourceSha256);
+        String chapterPath = workspace.storeChapterText(7, 8, 1, "recovered chapter");
+        workspace.recordBookVersion(7, 8);
+        repository.recordCommittedVersion(new EpubImportService.StoredBookVersion(
+                7, 8, 1, sourcePath, sourceSha256));
+        workspace.databaseCommitted();
+        Path workspaceDirectory = onlyStagingWorkspace();
+        return new PreparedImport(workspace, sourcePath, chapterPath, workspaceDirectory,
+                staged.path(), workspaceDirectory.resolve("chapter-1.txt"));
+    }
+
+    private Properties readProperties(Path path) throws IOException {
+        Properties properties = new Properties();
+        try (InputStream input = Files.newInputStream(path)) {
+            properties.load(input);
+        }
+        return properties;
+    }
+
+    private void writeProperties(Path path, Properties properties) throws IOException {
+        try (OutputStream output = Files.newOutputStream(path)) {
+            properties.store(output, "test journal mutation");
+        }
+    }
+
     private Path onlyStagingWorkspace() throws IOException {
         try (Stream<Path> paths = Files.list(storageRoot.resolve("staging"))) {
             return paths.filter(Files::isDirectory).findFirst().orElseThrow();
         }
+    }
+
+    private record PreparedImport(EpubImportService.ImportWorkspace workspace,
+                                  String sourcePath,
+                                  String chapterPath,
+                                  Path workspaceDirectory,
+                                  Path sourceStagingPath,
+                                  Path chapterStagingPath) {
     }
 
     private String resource(String name) throws IOException {

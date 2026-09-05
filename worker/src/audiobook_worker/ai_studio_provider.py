@@ -34,6 +34,7 @@ class GoogleAiStudioBrowserProvider:
         self.settings = settings
         self.diagnostics = diagnostics
         self.selectors = selectors
+        self._page: Any | None = None
 
     @classmethod
     def from_page(cls, page: Any) -> "GoogleAiStudioBrowserProvider":
@@ -47,6 +48,7 @@ class GoogleAiStudioBrowserProvider:
     async def health_check(self) -> RuntimeStatus:
         try:
             page = await self._prepare_page()
+            await self._wait_for_generation_state(page)
             if await self._first_visible(page, self.selectors.logged_out_indicators):
                 return RuntimeStatus(
                     False,
@@ -86,10 +88,19 @@ class GoogleAiStudioBrowserProvider:
         except WorkerError as exc:
             return RuntimeStatus(False, exc.code, str(exc))
 
+    async def capture_diagnostics(self, request_id: str, reason: str) -> None:
+        page = self._page
+        if page is None:
+            page = await self._prepare_page()
+        elif _is_page_closed(page):
+            return
+        await self._capture_diagnostics(page, request_id, reason)
+
     async def generate(
         self, request: GenerationRequest, destination: Path
     ) -> Path:
         page = await self._prepare_page()
+        await self._wait_for_generation_state(page)
         if await self._first_visible(page, self.selectors.logged_out_indicators):
             raise WorkerError(
                 ErrorCode.AUTH_REQUIRED,
@@ -198,11 +209,49 @@ class GoogleAiStudioBrowserProvider:
             )
         return destination
 
+    async def _wait_for_generation_state(self, page: Any) -> None:
+        """等待 AI Studio 的 SPA 控件挂载，或尽早识别需要人工处理的页面。"""
+        timeout_ms = min(
+            self.settings.generation_timeout_seconds * 1000,
+            10_000,
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_ms / 1000
+
+        while True:
+            if await self._first_visible(page, self.selectors.logged_out_indicators):
+                return
+            if await self._first_visible(page, self.selectors.quota_indicators):
+                return
+
+            text_input = await self._first_visible(page, self.selectors.text_input)
+            generate_action = await self._first_visible(
+                page, self.selectors.generate_action
+            )
+            if text_input is not None and generate_action is not None:
+                return
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+
+            interval_ms = min(250, max(1, int(remaining * 1000)))
+            waiter = getattr(page, "wait_for_timeout", None)
+            if callable(waiter):
+                result = waiter(interval_ms)
+                if inspect.isawaitable(result):
+                    await result
+            else:
+                await asyncio.sleep(interval_ms / 1000)
+
     async def _prepare_page(self) -> Any:
         timeout_ms = self.settings.generation_timeout_seconds * 1000
         target_url = str(self.settings.ai_studio_url)
         try:
-            page = await self.session.page_for(target_url)
+            page = self._page
+            if page is None or _is_page_closed(page):
+                page = await self.session.page_for(target_url)
+            self._page = page
             if str(getattr(page, "url", "")) != target_url:
                 await page.goto(
                     target_url,
@@ -215,6 +264,7 @@ class GoogleAiStudioBrowserProvider:
         except WorkerError:
             raise
         except PlaywrightTimeoutError as exc:
+            await _close_page(page)
             raise WorkerError(
                 ErrorCode.PAGE_NOT_READY,
                 "Google AI Studio page did not become ready",
@@ -290,8 +340,38 @@ class GoogleAiStudioBrowserProvider:
         for factory in candidates:
             try:
                 locator = factory(page)
-                if await locator.count() and await locator.is_visible():
-                    return locator
+                count = await locator.count()
+                for index in range(count):
+                    match = (
+                        locator.nth(index)
+                        if count > 1 and callable(getattr(locator, "nth", None))
+                        else locator
+                    )
+                    if await match.is_visible():
+                        return match
             except (AttributeError, TypeError):
                 continue
         return None
+
+
+def _is_page_closed(page: Any) -> bool:
+    checker = getattr(page, "is_closed", None)
+    if checker is None:
+        return False
+    try:
+        value = checker() if callable(checker) else checker
+        return bool(value)
+    except Exception:
+        return False
+
+
+async def _close_page(page: Any) -> None:
+    closer = getattr(page, "close", None)
+    if not callable(closer):
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        pass

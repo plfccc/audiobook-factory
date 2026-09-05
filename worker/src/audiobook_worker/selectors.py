@@ -59,7 +59,13 @@ AI_STUDIO_SELECTORS = SelectorCandidates(
     ),
     quota_indicators=(
         lambda page: page.get_by_text(
-            re.compile(r"quota|rate limit|too many requests", re.IGNORECASE)
+            re.compile(
+                r"(?:quota\s+(?:exceeded|exhausted|reached|paused)|"
+                r"(?:rate[-\s]?limit)\s+(?:exceeded|exhausted|reached|hit|paused)|"
+                r"too\s+many\s+requests|"
+                r"(?:exceeded|exhausted)\s+(?:your|the)\s+(?:current\s+)?quota)",
+                re.IGNORECASE,
+            )
         ),
         lambda page: page.locator(
             '[aria-label*="quota" i], [data-testid*="quota" i]'

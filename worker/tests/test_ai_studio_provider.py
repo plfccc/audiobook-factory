@@ -9,6 +9,7 @@ from audiobook_worker.ai_studio_provider import GoogleAiStudioBrowserProvider
 from audiobook_worker.config import WorkerSettings
 from audiobook_worker.contracts import GenerationRequest, RuntimeStatus, TtsPreset
 from audiobook_worker.errors import ErrorCode, WorkerError
+from audiobook_worker.selectors import AI_STUDIO_SELECTORS
 
 
 class _AccessibleControlParser(HTMLParser):
@@ -98,6 +99,9 @@ class FakeAiStudioPage:
         self.logged_out = False
         self.quota_paused = False
         self.timeout_phase = None
+        self.closed = False
+        self.wait_for_calls = 0
+        self.ready_after_waits = None
         self.url = "https://aistudio.google.com/generate-speech"
 
     def has_control(self, label):
@@ -140,6 +144,20 @@ class FakeAiStudioPage:
         if self.timeout_phase == "page":
             raise PlaywrightTimeoutError("page timed out")
 
+    async def wait_for_timeout(self, milliseconds):
+        self.wait_for_calls += 1
+        if (
+            self.ready_after_waits is not None
+            and self.wait_for_calls >= self.ready_after_waits
+        ):
+            self.labels.update({"Text to speech input", "Generate speech"})
+
+    def is_closed(self):
+        return self.closed
+
+    async def close(self, **kwargs):
+        self.closed = True
+
 
 class _FakeSession:
     def __init__(self, page):
@@ -147,6 +165,16 @@ class _FakeSession:
 
     async def page_for(self, url):
         return self.page
+
+
+class _CountingFakeSession(_FakeSession):
+    def __init__(self, page):
+        super().__init__(page)
+        self.page_for_calls = 0
+
+    async def page_for(self, url):
+        self.page_for_calls += 1
+        return await super().page_for(url)
 
 
 class _RecordingDiagnostics:
@@ -158,6 +186,41 @@ class _RecordingDiagnostics:
         self.captures.append((page, request_id, reason))
         if self.fail:
             raise OSError("diagnostics unavailable")
+
+
+class _MultipleMatchLocator:
+    def __init__(self, visible_indexes):
+        self.visible_indexes = set(visible_indexes)
+        self.index = None
+
+    async def count(self):
+        return 2
+
+    def nth(self, index):
+        locator = _SingleMatchLocator(index in self.visible_indexes)
+        locator.index = index
+        return locator
+
+    async def is_visible(self, **kwargs):
+        raise RuntimeError("strict mode violation")
+
+
+class _SingleMatchLocator:
+    def __init__(self, visible):
+        self.visible = visible
+        self.index = None
+
+    async def is_visible(self, **kwargs):
+        return self.visible
+
+
+class _PatternRecordingPage:
+    def __init__(self):
+        self.pattern = None
+
+    def get_by_text(self, pattern, **kwargs):
+        self.pattern = pattern
+        return object()
 
 
 @pytest.fixture
@@ -314,6 +377,86 @@ def test_check_auth_reports_logged_out_status(tmp_path, fake_ai_studio_page):
         assert status == RuntimeStatus(
             False, ErrorCode.AUTH_REQUIRED, "Google AI Studio requires manual sign-in"
         )
+
+    asyncio.run(exercise())
+
+
+def test_generate_waits_for_spa_controls_after_navigation(
+    tmp_path, fake_ai_studio_page
+):
+    async def exercise():
+        fake_ai_studio_page.labels.clear()
+        fake_ai_studio_page.ready_after_waits = 2
+        provider = _provider(tmp_path, fake_ai_studio_page)
+
+        result = await provider.generate(
+            _request(tmp_path), tmp_path / "download.wav"
+        )
+
+        assert result == tmp_path / "download.wav"
+        assert fake_ai_studio_page.wait_for_calls >= 2
+        assert fake_ai_studio_page.generate_clicks == 1
+
+    asyncio.run(exercise())
+
+
+def test_first_visible_checks_each_match_without_strict_mode_failure():
+    async def exercise():
+        locator = await GoogleAiStudioBrowserProvider._first_visible(
+            object(), (lambda _page: _MultipleMatchLocator({1}),)
+        )
+
+        assert locator is not None
+        assert locator.index == 1
+
+    asyncio.run(exercise())
+
+
+def test_quota_indicator_does_not_match_rate_limits_navigation_link():
+    page = _PatternRecordingPage()
+
+    AI_STUDIO_SELECTORS.quota_indicators[0](page)
+
+    assert page.pattern.search("Rate limits") is None
+    assert page.pattern.search("Quota exceeded") is not None
+    assert page.pattern.search("Rate limit exceeded") is not None
+
+
+def test_capture_diagnostics_reuses_page_after_navigation_timeout(
+    tmp_path, fake_ai_studio_page
+):
+    async def exercise():
+        fake_ai_studio_page.timeout_phase = "page"
+        session = _CountingFakeSession(fake_ai_studio_page)
+        diagnostics = _RecordingDiagnostics()
+        settings = WorkerSettings(
+            AI_STUDIO_URL="https://aistudio.google.com/generate-speech",
+            OUTPUT_DIR=tmp_path,
+            DIAGNOSTICS_DIR=tmp_path / "diagnostics",
+            GENERATION_TIMEOUT_SECONDS=1,
+        )
+        provider = GoogleAiStudioBrowserProvider(session, settings, diagnostics)
+
+        status = await provider.check_auth()
+        assert status.code is ErrorCode.PAGE_NOT_READY
+
+        await provider.capture_diagnostics("p0-001", "auth:PAGE_NOT_READY")
+
+        assert session.page_for_calls == 1
+        assert diagnostics.captures == []
+
+    asyncio.run(exercise())
+
+
+def test_navigation_timeout_closes_stuck_page(tmp_path, fake_ai_studio_page):
+    async def exercise():
+        fake_ai_studio_page.timeout_phase = "page"
+        provider = _provider(tmp_path, fake_ai_studio_page)
+
+        status = await provider.check_auth()
+
+        assert status.code is ErrorCode.PAGE_NOT_READY
+        assert fake_ai_studio_page.closed is True
 
     asyncio.run(exercise())
 

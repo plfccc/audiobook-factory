@@ -1,0 +1,25 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: audiobook-factory-control-center
+  datasource:
+    url: ${DB_URL:}
+    username: ${DB_USERNAME:}
+    password: ${DB_PASSWORD:}
+    driver-class-name: org.postgresql.Driver
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+app:
+  storage-root: ${STORAGE_ROOT:./data}
+  worker-enroll-token: ${WORKER_ENROLL_TOKEN:}
+  access-token: ${APP_ACCESS_TOKEN:}

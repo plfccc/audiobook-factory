@@ -1,0 +1,12 @@
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 2
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+app:
+  storage-root: ${STORAGE_ROOT:target/test-storage}
+  worker-enroll-token: ${WORKER_ENROLL_TOKEN:}
+  access-token: ${APP_ACCESS_TOKEN:}

@@ -15,6 +15,34 @@ def _required(value: str, name: str) -> str:
 
 
 @dataclass(frozen=True)
+class EngineCapabilities:
+    languages: tuple[str, ...]
+    voice_design: bool
+    voice_clone: bool
+    emotion_control: bool
+    duration_control: bool
+
+
+@dataclass(frozen=True)
+class VoiceProfile:
+    profile_id: str
+    name: str
+    reference_audio_path: Path | None = None
+    reference_text: str | None = None
+    design_prompt: str | None = None
+
+
+@dataclass(frozen=True)
+class PreparedVoice:
+    profile_id: str
+    cache_key: str
+    reference_audio_path: Path | None = None
+    reference_text: str | None = None
+    design_prompt: str | None = None
+    clone_prompt: str | None = None
+
+
+@dataclass(frozen=True)
 class TtsPreset:
     provider: str
     model: str
@@ -22,12 +50,30 @@ class TtsPreset:
     style_prompt: str
     language: str
     output_format: str
+    model_version: str = "unspecified"
+    voice_profile_id: str | None = None
+    parameters_json: str = "{}"
+    segment_target_chars: int = 220
+    segment_max_chars: int = 320
 
     def __post_init__(self) -> None:
         for name in ("provider", "model", "voice", "language", "output_format"):
             _required(getattr(self, name), name)
         if self.output_format.lower() not in _FORMATS:
             raise ValueError(f"unsupported output_format: {self.output_format}")
+
+
+@dataclass(frozen=True)
+class TtsJob:
+    job_id: str
+    book_id: str
+    book_version_id: str
+    chapter_id: str
+    chapter_index: int
+    segment_index: int
+    text: str
+    preset: TtsPreset
+    voice_profile: VoiceProfile | None = None
 
 
 @dataclass(frozen=True)

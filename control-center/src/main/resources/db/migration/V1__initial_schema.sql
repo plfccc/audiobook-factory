@@ -101,6 +101,7 @@ CREATE TABLE worker_registration (
 
 CREATE INDEX idx_book_status ON book (status);
 CREATE INDEX idx_book_version_book_id ON book_version (book_id);
+CREATE INDEX idx_chapter_book_version_id ON chapter (book_version_id);
 CREATE INDEX idx_chapter_status ON chapter (status);
 CREATE INDEX idx_generation_job_status_lease ON generation_job (status, lease_expires_at);
 CREATE INDEX idx_generation_job_chapter_id ON generation_job (chapter_id);

@@ -1,6 +1,8 @@
 import sys
 import types
 
+import pytest
+
 from audiobook_worker.runtime_probe import RuntimeProbe
 
 
@@ -70,3 +72,36 @@ def test_detect_is_safe_when_torch_is_not_installed(monkeypatch):
     assert probe.gpu_memory_bytes == 0
     assert probe.cuda_version is None
     assert probe.torch_version is None
+
+
+class _FailingCuda:
+    def __init__(self, failure_phase):
+        self.failure_phase = failure_phase
+
+    def is_available(self):
+        if self.failure_phase == "availability":
+            raise RuntimeError("CUDA driver initialization failed")
+        return True
+
+    def get_device_name(self, index):
+        if self.failure_phase == "name":
+            raise RuntimeError("device name query failed")
+        return "Test GPU"
+
+    def get_device_properties(self, index):
+        if self.failure_phase == "properties":
+            raise RuntimeError("device properties query failed")
+        return types.SimpleNamespace(total_memory=16 * 1024**3)
+
+
+@pytest.mark.parametrize("failure_phase", ["availability", "name", "properties"])
+def test_detect_maps_cuda_runtime_errors_to_unavailable(monkeypatch, failure_phase):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(_FailingCuda(failure_phase)))
+
+    probe = RuntimeProbe.detect()
+
+    assert probe.cuda_available is False
+    assert probe.gpu_name is None
+    assert probe.gpu_memory_bytes == 0
+    assert probe.cuda_version is None
+    assert probe.torch_version == "2.7.0"

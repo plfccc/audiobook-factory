@@ -31,6 +31,9 @@ class VoiceProfile:
     reference_text: str | None = None
     design_prompt: str | None = None
 
+    def __post_init__(self) -> None:
+        _required(self.profile_id, "profile_id")
+
 
 @dataclass(frozen=True)
 class PreparedVoice:
@@ -40,6 +43,10 @@ class PreparedVoice:
     reference_text: str | None = None
     design_prompt: str | None = None
     clone_prompt: str | None = None
+
+    def __post_init__(self) -> None:
+        _required(self.profile_id, "profile_id")
+        _required(self.cache_key, "cache_key")
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,24 @@ class TtsPreset:
             _required(getattr(self, name), name)
         if self.output_format.lower() not in _FORMATS:
             raise ValueError(f"unsupported output_format: {self.output_format}")
+        if self.model_version is not None:
+            _required(self.model_version, "model_version")
+        if self.voice_profile_id is not None:
+            _required(self.voice_profile_id, "voice_profile_id")
+        if not isinstance(self.parameters_json, str):
+            raise ValueError("parameters_json must be valid JSON")
+        try:
+            json.loads(self.parameters_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("parameters_json must be valid JSON") from exc
+        if type(self.segment_target_chars) is not int or self.segment_target_chars <= 0:
+            raise ValueError("segment_target_chars must be a positive integer")
+        if type(self.segment_max_chars) is not int or self.segment_max_chars <= 0:
+            raise ValueError("segment_max_chars must be a positive integer")
+        if self.segment_target_chars > self.segment_max_chars:
+            raise ValueError(
+                "segment_target_chars must not exceed segment_max_chars"
+            )
 
 
 @dataclass(frozen=True)
@@ -74,6 +99,23 @@ class TtsJob:
     text: str
     preset: TtsPreset
     voice_profile: VoiceProfile | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("job_id", "book_id", "book_version_id", "chapter_id"):
+            _required(getattr(self, name), name)
+        for name in ("chapter_index", "segment_index"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        _required(self.text, "text")
+        if (
+            self.voice_profile is not None
+            and self.preset.voice_profile_id is not None
+            and self.voice_profile.profile_id != self.preset.voice_profile_id
+        ):
+            raise ValueError(
+                "voice_profile.profile_id must match preset.voice_profile_id"
+            )
 
 
 @dataclass(frozen=True)

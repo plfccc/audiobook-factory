@@ -20,16 +20,20 @@ def detect_runtime() -> RuntimeProbe:
     python_version = platform.python_version()
     try:
         import torch
-    except (ImportError, OSError):
+    except Exception:
         return RuntimeProbe(False, None, 0, None, None, python_version)
 
     torch_version = str(getattr(torch, "__version__", "unknown"))
-    cuda = getattr(torch, "cuda", None)
-    if cuda is None or not cuda.is_available():
+    try:
+        cuda = getattr(torch, "cuda", None)
+        if cuda is None or not cuda.is_available():
+            return RuntimeProbe(False, None, 0, None, torch_version, python_version)
+
+        gpu_name = str(cuda.get_device_name(0))
+        gpu_memory_bytes = int(cuda.get_device_properties(0).total_memory)
+    except Exception:
         return RuntimeProbe(False, None, 0, None, torch_version, python_version)
 
-    gpu_name = str(cuda.get_device_name(0))
-    gpu_memory_bytes = int(cuda.get_device_properties(0).total_memory)
     torch_runtime = getattr(torch, "version", None)
     cuda_version = getattr(torch_runtime, "cuda", None)
     if cuda_version is not None:

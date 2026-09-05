@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,34 @@ from audiobook_worker.contracts import (
     VoiceProfile,
 )
 from audiobook_worker.tts_engine import TtsEngine
+
+
+def _preset(**overrides):
+    values = {
+        "provider": "qwen3-tts",
+        "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "voice": "voice-1",
+        "style_prompt": "自然朗读。",
+        "language": "zh-CN",
+        "output_format": "wav",
+    }
+    values.update(overrides)
+    return TtsPreset(**values)
+
+
+def _job(**overrides):
+    values = {
+        "job_id": "job-1",
+        "book_id": "book-1",
+        "book_version_id": "book-version-1",
+        "chapter_id": "chapter-1",
+        "chapter_index": 1,
+        "segment_index": 1,
+        "text": "第一句话。",
+        "preset": _preset(),
+    }
+    values.update(overrides)
+    return TtsJob(**values)
 
 
 def test_tts_contracts_keep_voice_and_job_metadata():
@@ -85,3 +114,66 @@ def test_legacy_tts_preset_constructor_uses_new_defaults():
     assert preset.parameters_json == "{}"
     assert preset.segment_target_chars == 220
     assert preset.segment_max_chars == 320
+
+
+def test_tts_preset_rejects_invalid_json_and_segment_ranges():
+    with pytest.raises(ValueError, match="parameters_json"):
+        _preset(parameters_json="not-json")
+    with pytest.raises(ValueError, match="segment_target_chars"):
+        _preset(segment_target_chars=0)
+    with pytest.raises(ValueError, match="segment_max_chars"):
+        _preset(segment_max_chars=0)
+    with pytest.raises(ValueError, match="segment_target_chars"):
+        _preset(segment_target_chars=321, segment_max_chars=320)
+
+
+def test_voice_profile_rejects_blank_profile_id():
+    with pytest.raises(ValueError, match="profile_id"):
+        VoiceProfile(" ", "旁白")
+
+
+@pytest.mark.parametrize("field", ["profile_id", "cache_key"])
+def test_prepared_voice_rejects_blank_memory_ids(field):
+    values = {"profile_id": "voice-1", "cache_key": "cache-key"}
+    values[field] = " "
+    with pytest.raises(ValueError, match=field):
+        PreparedVoice(**values)
+
+
+def test_tts_preset_rejects_blank_voice_profile_id():
+    with pytest.raises(ValueError, match="voice_profile_id"):
+        _preset(voice_profile_id=" ")
+
+
+@pytest.mark.parametrize("field", ["job_id", "book_id", "book_version_id", "chapter_id"])
+def test_tts_job_rejects_blank_ids(field):
+    with pytest.raises(ValueError, match=field):
+        _job(**{field: " "})
+
+
+@pytest.mark.parametrize("field", ["chapter_index", "segment_index"])
+def test_tts_job_rejects_negative_indexes(field):
+    with pytest.raises(ValueError, match=field):
+        _job(**{field: -1})
+
+
+def test_tts_job_rejects_mismatched_voice_profile_id():
+    with pytest.raises(ValueError, match="voice_profile"):
+        _job(
+            preset=_preset(voice_profile_id="voice-1"),
+            voice_profile=VoiceProfile("voice-2", "另一位旁白"),
+        )
+
+
+def test_prepared_voice_clone_prompt_is_not_in_job_or_preset_payload():
+    profile = VoiceProfile("voice-1", "旁白")
+    prepared = PreparedVoice(
+        profile_id="voice-1",
+        cache_key="voice-1:cache-key",
+        clone_prompt="worker-memory-only",
+    )
+    job = _job(preset=_preset(voice_profile_id=profile.profile_id), voice_profile=profile)
+
+    assert prepared.clone_prompt == "worker-memory-only"
+    assert "clone_prompt" not in asdict(job)
+    assert "clone_prompt" not in asdict(job.preset)

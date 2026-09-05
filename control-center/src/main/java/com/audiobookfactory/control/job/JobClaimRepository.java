@@ -127,6 +127,7 @@ public class JobClaimRepository {
                 workerId,
                 timestamp,
                 timestamp,
+                timestamp,
                 timestamp);
         if (claims.isEmpty()) {
             return null;

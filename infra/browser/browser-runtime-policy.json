@@ -1,0 +1,4 @@
+{
+  "DefaultDownloadDirectory": "/data/downloads",
+  "PromptForDownloadLocation": false
+}

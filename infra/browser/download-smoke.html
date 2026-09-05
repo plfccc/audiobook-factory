@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser runtime download smoke test</title>
+<a id="download" href="data:text/plain,browser-runtime-download">Download smoke payload</a>
+<script>
+  const download = document.getElementById("download");
+  const filename = new URLSearchParams(window.location.search).get("filename");
+
+  if (!/^browser-runtime-smoke-download-[0-9a-f]{32}\.txt$/.test(filename ?? "")) {
+    throw new Error("Missing or invalid smoke download filename");
+  }
+
+  download.download = filename;
+  download.click();
+</script>

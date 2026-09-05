@@ -1,0 +1,18 @@
+services:
+  browser:
+    build:
+      context: ../browser
+    ports:
+      - "127.0.0.1:6080:6080"
+      - "127.0.0.1:9222:9222"
+    volumes:
+      - ../../data/chrome-profile:/data/chrome-profile
+      - ../../data/downloads:/data/downloads
+      - ../../data/diagnostics:/data/diagnostics
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "http://127.0.0.1:9222/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped

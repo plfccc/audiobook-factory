@@ -1,0 +1,47 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+external-controller: 0.0.0.0:9090
+
+# 公网入口单独使用认证监听；不要把内部 7890 直接暴露到公网。
+listeners:
+  - name: public-mixed
+    type: mixed
+    listen: 0.0.0.0
+    port: 7891
+    users:
+      - username: audiobook
+        password: change-this-password
+
+profile:
+  store-selected: true
+
+proxy-providers:
+  subscription:
+    type: file
+    path: /etc/mihomo/subscription.base64
+    health-check:
+      enable: true
+      url: https://accounts.google.com/
+      interval: 300
+
+proxy-groups:
+  - name: PROXY
+    type: url-test
+    use:
+      - subscription
+    # Google AI Studio 仅在部分地区提供服务，排除会被判定为不支持地区的出口。
+    filter: '🇨🇳台湾专线01\|BGP\|流媒体'
+    url: https://accounts.google.com/
+    interval: 300
+    timeout: 5000
+    tolerance: 50
+    lazy: false
+
+rules:
+  - MATCH,PROXY

@@ -3,7 +3,7 @@ FROM debian:bookworm-slim
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
-    && packages=(chromium xvfb x11vnc novnc supervisor curl ca-certificates fonts-noto-cjk) \
+    && packages=(chromium xvfb x11vnc novnc supervisor socat curl ca-certificates fonts-noto-cjk) \
     && pinned_packages=() \
     && for package in "${packages[@]}"; do \
          version="$(apt-cache policy "${package}" | awk '/Candidate:/ { print $2 }')"; \

@@ -1,0 +1,8 @@
+{
+  "provider": "google-ai-studio-browser",
+  "model": "gemini-tts",
+  "voice": "Kore",
+  "style_prompt": "自然、清晰、语速稳定地朗读，不要添加额外内容。",
+  "language": "zh-CN",
+  "output_format": "wav"
+}

@@ -1,4 +1,26 @@
 services:
+  proxy:
+    build:
+      context: ../proxy
+    ports:
+      - "127.0.0.1:7890:7890"
+      - "0.0.0.0:7891:7891"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ${P0_PROXY_DIR:-/opt/audiobook-factory-proxy}/mihomo:/usr/local/bin/mihomo:ro
+      - ${P0_PROXY_DIR:-/opt/audiobook-factory-proxy}/config.yaml:/etc/mihomo/config.yaml:ro
+      - ${P0_PROXY_DIR:-/opt/audiobook-factory-proxy}/subscription.base64:/etc/mihomo/subscription.base64:ro
+      - ${P0_PROXY_DIR:-/opt/audiobook-factory-proxy}/data:/etc/mihomo/data
+    working_dir: /etc/mihomo
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "http://127.0.0.1:9090/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    init: true
+    restart: unless-stopped
+
   browser:
     build:
       context: ../browser
@@ -15,4 +37,26 @@ services:
       timeout: 3s
       retries: 12
       start_period: 10s
+    depends_on:
+      proxy:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../../worker
+    network_mode: service:browser
+    depends_on:
+      browser:
+        condition: service_healthy
+    environment:
+      CDP_URL: http://127.0.0.1:9222
+      OUTPUT_DIR: /data/books
+      DIAGNOSTICS_DIR: /data/diagnostics
+    volumes:
+      - ../../data/books:/data/books
+      - ../../data/diagnostics:/data/diagnostics
+      - ../../examples:/app/examples:ro
+    working_dir: /app
+    init: true
     restart: unless-stopped

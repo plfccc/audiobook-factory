@@ -32,6 +32,7 @@ curl --silent --fail http://127.0.0.1:9222/json/version >/dev/null
 curl --silent --fail http://127.0.0.1:6080/vnc.html >/dev/null
 test "$(docker compose -f infra/p0/docker-compose.yml port browser 6080)" = "127.0.0.1:6080"
 test "$(docker compose -f infra/p0/docker-compose.yml port browser 9222)" = "127.0.0.1:9222"
+test "$(docker compose -f infra/p0/docker-compose.yml exec -T browser stat -c '%a' /data/downloads)" = "700"
 
 curl --silent --fail --request PUT \
   "http://127.0.0.1:9222/json/new?http://127.0.0.1:6080/download-smoke.html?filename=${download_name}" >/dev/null

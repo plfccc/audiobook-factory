@@ -93,6 +93,58 @@ class EpubImportServiceTest {
     }
 
     @Test
+    void decodesXhtmlUsingItsUtf16BomAndXmlEncodingDeclaration() throws Exception {
+        Map<String, byte[]> entries = fixtureEntriesAsBytes();
+        String xhtml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>"
+                + "<html xmlns=\"http://www.w3.org/1999/xhtml\">"
+                + "<head><title>编码章节</title></head>"
+                + "<body><h1>编码章节</h1><p>UTF-16 内容 Café。</p></body></html>";
+        entries.put("OPS/text/first.xhtml", xhtml.getBytes(StandardCharsets.UTF_16));
+
+        List<ChapterDraft> chapters = new EpubChapterExtractor().extract(writeRawZip(entries));
+
+        assertThat(chapters.get(0).text()).contains("UTF-16 内容 Café。");
+    }
+
+    @Test
+    void removesUncommittedImportStagingDuringReconciliation() throws Exception {
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        EpubImportService.ImportWorkspace workspace = fileStorage.beginImport();
+        workspace.stage(new ByteArrayInputStream(fixtureBytes()));
+        workspace.close();
+
+        new EpubImportService(repository, fileStorage).reconcileStaging();
+
+        try (Stream<Path> files = Files.walk(storageRoot)) {
+            assertThat(files.filter(Files::isRegularFile).toList()).isEmpty();
+        }
+    }
+
+    @Test
+    void promotesCommittedImportAfterPromotionWasInterrupted() throws Exception {
+        byte[] sourceBytes = fixtureBytes();
+        String sourceSha256 = sha256(sourceBytes);
+        EpubImportService.FileBookStorage fileStorage = new EpubImportService.FileBookStorage(storageRoot);
+        EpubImportService.ImportWorkspace workspace = fileStorage.beginImport();
+        EpubImportService.StagedSource staged = workspace.stage(new ByteArrayInputStream(sourceBytes));
+        String sourcePath = workspace.storeSource(staged.path(), "sample.epub", sourceSha256);
+        String chapterPath = workspace.storeChapterText(7, 8, 1, "recovered chapter");
+        workspace.recordBookVersion(7, 8);
+        repository.recordCommittedVersion(new EpubImportService.StoredBookVersion(
+                7, 8, 1, sourcePath, sourceSha256));
+        workspace.databaseCommitted();
+        workspace.close();
+
+        new EpubImportService(repository, fileStorage).reconcileStaging();
+
+        assertThat(Files.exists(Path.of(sourcePath))).isTrue();
+        assertThat(Files.readString(Path.of(chapterPath))).isEqualTo("recovered chapter");
+        try (Stream<Path> files = Files.list(storageRoot.resolve("staging"))) {
+            assertThat(files.filter(Files::isDirectory).toList()).isEmpty();
+        }
+    }
+
+    @Test
     void returnsExistingVersionForDuplicateSourceWithoutCreatingChaptersOrJobs() throws Exception {
         BookImportResult first = service.importBook(fixture(), "sample.epub");
         int chapterCountAfterFirstImport = repository.chapterCount();
@@ -302,6 +354,14 @@ class EpubImportServiceTest {
         return entries;
     }
 
+    private Map<String, byte[]> fixtureEntriesAsBytes() throws IOException {
+        Map<String, byte[]> entries = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : fixtureEntries().entrySet()) {
+            entries.put(entry.getKey(), entry.getValue().getBytes(StandardCharsets.UTF_8));
+        }
+        return entries;
+    }
+
     private Path writeZip(Map<String, String> entries) throws IOException {
         return writeZip(entries, true);
     }
@@ -309,6 +369,12 @@ class EpubImportServiceTest {
     private Path writeZip(Map<String, String> entries, boolean storeMimetype) throws IOException {
         Path epub = Files.createTempFile(storageRoot, "fixture-", ".epub");
         Files.write(epub, zipBytes(entries, storeMimetype));
+        return epub;
+    }
+
+    private Path writeRawZip(Map<String, byte[]> entries) throws IOException {
+        Path epub = Files.createTempFile(storageRoot, "fixture-", ".epub");
+        Files.write(epub, rawZipBytes(entries));
         return epub;
     }
 
@@ -324,6 +390,29 @@ class EpubImportServiceTest {
                 zipEntry.setTime(0L);
                 byte[] bytes = entry.getValue().getBytes(StandardCharsets.UTF_8);
                 if (storeMimetype && "mimetype".equals(entry.getKey())) {
+                    CRC32 crc = new CRC32();
+                    crc.update(bytes);
+                    zipEntry.setMethod(ZipEntry.STORED);
+                    zipEntry.setSize(bytes.length);
+                    zipEntry.setCompressedSize(bytes.length);
+                    zipEntry.setCrc(crc.getValue());
+                }
+                zip.putNextEntry(zipEntry);
+                zip.write(bytes);
+                zip.closeEntry();
+            }
+        }
+        return output.toByteArray();
+    }
+
+    private byte[] rawZipBytes(Map<String, byte[]> entries) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(output)) {
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                ZipEntry zipEntry = new ZipEntry(entry.getKey());
+                zipEntry.setTime(0L);
+                byte[] bytes = entry.getValue();
+                if ("mimetype".equals(entry.getKey())) {
                     CRC32 crc = new CRC32();
                     crc.update(bytes);
                     zipEntry.setMethod(ZipEntry.STORED);
@@ -442,6 +531,10 @@ class EpubImportServiceTest {
 
         void failOnCreateChapter() {
             failOnCreateChapter = true;
+        }
+
+        void recordCommittedVersion(EpubImportService.StoredBookVersion version) {
+            versions.add(version);
         }
 
         ChapterRow findChapter(int index) {

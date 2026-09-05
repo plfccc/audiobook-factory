@@ -15,6 +15,9 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -26,11 +29,14 @@ import java.security.NoSuchAlgorithmException;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 @Service
 public class EpubImportService {
@@ -127,41 +133,64 @@ public class EpubImportService {
 
     public BookImportResult importBook(InputStream source, String originalFilename) {
         validateUploadName(source, originalFilename);
+        reconcileStaging();
 
-        StagedSource staged = null;
+        ImportWorkspace workspace = null;
+        boolean databaseCommitted = false;
         try {
-            staged = storage.stage(new LimitedInputStream(source, importLimits.maxSourceBytes()));
+            workspace = storage.beginImport();
+            StagedSource staged = workspace.stage(
+                    new LimitedInputStream(source, importLimits.maxSourceBytes()));
             Optional<StoredBookVersion> existing = repository.findBySourceSha256(staged.sha256());
             if (existing.isPresent()) {
                 return toImportResult(existing.get());
             }
 
-            StagedSource upload = staged;
-            List<String> storedFiles = new ArrayList<>();
+            ImportWorkspace activeWorkspace = workspace;
+            BookImportResult result;
             try {
-                return executeInTransaction(() -> importNewBook(
-                        upload, originalFilename, storedFiles));
+                result = executeInTransaction(() -> importNewBook(
+                        activeWorkspace, staged, originalFilename));
             } catch (DataIntegrityViolationException exception) {
-                deleteStoredFiles(storedFiles);
-                Optional<StoredBookVersion> winner = repository.findBySourceSha256(upload.sha256());
+                abortWorkspace(activeWorkspace);
+                Optional<StoredBookVersion> winner = repository.findBySourceSha256(staged.sha256());
                 if (winner.isPresent()) {
                     return toImportResult(winner.get());
                 }
                 throw exception;
             } catch (RuntimeException exception) {
-                deleteStoredFiles(storedFiles);
+                abortWorkspace(activeWorkspace);
                 throw exception;
             }
+
+            databaseCommitted = true;
+            try {
+                activeWorkspace.databaseCommitted();
+                activeWorkspace.promote();
+                activeWorkspace.finish();
+            } catch (IOException exception) {
+                throw new IllegalStateException(
+                        "EPUB database commit succeeded but file promotion is incomplete", exception);
+            }
+            return result;
         } catch (IOException exception) {
             throw new IllegalStateException("Unable to stage EPUB upload", exception);
         } finally {
-            if (staged != null) {
-                try {
-                    storage.delete(staged.path().toString());
-                } catch (IOException | RuntimeException ignored) {
-                    // 临时文件清理失败不应覆盖原始导入错误。
+            if (workspace != null) {
+                if (databaseCommitted) {
+                    closeWorkspace(workspace);
+                } else {
+                    abortWorkspace(workspace);
                 }
             }
+        }
+    }
+
+    public void reconcileStaging() {
+        try {
+            storage.reconcile(repository);
+        } catch (IOException exception) {
+            throw new IllegalStateException("Unable to reconcile EPUB import staging", exception);
         }
     }
 
@@ -176,8 +205,8 @@ public class EpubImportService {
         return result;
     }
 
-    private BookImportResult importNewBook(StagedSource staged, String originalFilename,
-                                           List<String> storedFiles) {
+    private BookImportResult importNewBook(ImportWorkspace workspace, StagedSource staged,
+                                           String originalFilename) {
         try {
             List<ChapterDraft> chapters = chapterExtractor.extract(staged.path());
             if (chapters.isEmpty()) {
@@ -185,8 +214,7 @@ public class EpubImportService {
                         "INVALID_EPUB_STRUCTURE", "EPUB does not contain readable spine chapters");
             }
 
-            String sourcePath = storage.storeSource(staged.path(), originalFilename, staged.sha256());
-            storedFiles.add(sourcePath);
+            String sourcePath = workspace.storeSource(staged.path(), originalFilename, staged.sha256());
 
             long bookId = repository.createBook(bookTitle(originalFilename));
             long bookVersionId = repository.createBookVersion(
@@ -196,11 +224,12 @@ public class EpubImportService {
                     PARSER_VERSION,
                     segmentationPolicy.rulesVersion(),
                     chapters.size());
+            workspace.recordBookVersion(bookId, bookVersionId);
             for (int chapterOffset = 0; chapterOffset < chapters.size(); chapterOffset++) {
                 ChapterDraft chapter = chapters.get(chapterOffset);
                 int chapterNumber = chapterOffset + 1;
-                String textPath = storage.storeChapterText(bookId, bookVersionId, chapterNumber, chapter.text());
-                storedFiles.add(textPath);
+                String textPath = workspace.storeChapterText(
+                        bookId, bookVersionId, chapterNumber, chapter.text());
                 long chapterId = repository.createChapter(
                         bookVersionId,
                         chapterNumber,
@@ -227,13 +256,19 @@ public class EpubImportService {
                 version.bookId(), version.bookVersionId(), version.chapterCount(), version.sourceSha256());
     }
 
-    private void deleteStoredFiles(List<String> storedFiles) {
-        for (int index = storedFiles.size() - 1; index >= 0; index--) {
-            try {
-                storage.delete(storedFiles.get(index));
-            } catch (IOException | RuntimeException ignored) {
-                // 数据库事务会回滚；残留文件不应覆盖导致回滚的异常。
-            }
+    private void abortWorkspace(ImportWorkspace workspace) {
+        try {
+            workspace.abort();
+        } catch (IOException | RuntimeException ignored) {
+            // journal 会保留到下一次 reconcile，不能覆盖原始导入错误。
+        }
+    }
+
+    private void closeWorkspace(ImportWorkspace workspace) {
+        try {
+            workspace.close();
+        } catch (IOException | RuntimeException ignored) {
+            // 已提交导入保留 journal，下一次 reconcile 会继续处理。
         }
     }
 
@@ -303,6 +338,120 @@ public class EpubImportService {
         String storeChapterText(long bookId, long bookVersionId, int chapterNumber, String text) throws IOException;
 
         void delete(String storedPath) throws IOException;
+
+        default ImportWorkspace beginImport() throws IOException {
+            return new LegacyImportWorkspace(this);
+        }
+
+        default void reconcile(BookRepository repository) throws IOException {
+        }
+    }
+
+    public interface ImportWorkspace {
+
+        StagedSource stage(InputStream source) throws IOException;
+
+        String storeSource(Path stagedSource, String originalFilename, String sourceSha256) throws IOException;
+
+        String storeChapterText(long bookId, long bookVersionId, int chapterNumber, String text)
+                throws IOException;
+
+        void recordBookVersion(long bookId, long bookVersionId) throws IOException;
+
+        void databaseCommitted() throws IOException;
+
+        void promote() throws IOException;
+
+        void finish() throws IOException;
+
+        void abort() throws IOException;
+
+        void close() throws IOException;
+    }
+
+    private static final class LegacyImportWorkspace implements ImportWorkspace {
+
+        private final BookStorage storage;
+        private final List<String> storedPaths = new ArrayList<>();
+        private Path stagedPath;
+        private boolean aborted;
+
+        private LegacyImportWorkspace(BookStorage storage) {
+            this.storage = storage;
+        }
+
+        @Override
+        public StagedSource stage(InputStream source) throws IOException {
+            StagedSource staged = storage.stage(source);
+            stagedPath = staged.path();
+            return staged;
+        }
+
+        @Override
+        public String storeSource(Path stagedSource, String originalFilename, String sourceSha256)
+                throws IOException {
+            String storedPath = storage.storeSource(stagedSource, originalFilename, sourceSha256);
+            storedPaths.add(storedPath);
+            return storedPath;
+        }
+
+        @Override
+        public String storeChapterText(long bookId, long bookVersionId, int chapterNumber, String text)
+                throws IOException {
+            String storedPath = storage.storeChapterText(bookId, bookVersionId, chapterNumber, text);
+            storedPaths.add(storedPath);
+            return storedPath;
+        }
+
+        @Override
+        public void recordBookVersion(long bookId, long bookVersionId) {
+        }
+
+        @Override
+        public void databaseCommitted() {
+        }
+
+        @Override
+        public void promote() {
+        }
+
+        @Override
+        public void finish() {
+        }
+
+        @Override
+        public void abort() throws IOException {
+            if (aborted) {
+                return;
+            }
+            aborted = true;
+            IOException firstFailure = null;
+            for (int index = storedPaths.size() - 1; index >= 0; index--) {
+                try {
+                    storage.delete(storedPaths.get(index));
+                } catch (IOException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception;
+                    }
+                }
+            }
+            if (stagedPath != null) {
+                try {
+                    storage.delete(stagedPath.toString());
+                } catch (IOException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception;
+                    }
+                }
+            }
+            if (firstFailure != null) {
+                throw firstFailure;
+            }
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
     public record StoredBookVersion(
@@ -375,6 +524,15 @@ public class EpubImportService {
 
     public static final class FileBookStorage implements BookStorage {
 
+        private static final String STAGING_DIRECTORY_NAME = "staging";
+        private static final String JOURNAL_FILENAME = "journal.properties";
+        private static final String LOCK_FILENAME = "process.lock";
+        private static final String STATE_PREPARED = "PREPARED";
+        private static final String STATE_DB_COMMITTED = "DB_COMMITTED";
+        private static final String STATE_PROMOTING = "PROMOTING";
+        private static final String STATE_PROMOTED = "PROMOTED";
+        private static final String STATE_ABORTED = "ABORTED";
+
         private final Path storageRoot;
 
         public FileBookStorage(Path storageRoot) {
@@ -383,13 +541,37 @@ public class EpubImportService {
         }
 
         @Override
+        public ImportWorkspace beginImport() throws IOException {
+            return new FileImportWorkspace(this);
+        }
+
+        @Override
+        public void reconcile(BookRepository repository) throws IOException {
+            Path stagingRoot = storageRoot.resolve(STAGING_DIRECTORY_NAME).normalize();
+            if (!Files.isDirectory(stagingRoot)) {
+                return;
+            }
+            List<Path> workspaces;
+            try (Stream<Path> paths = Files.list(stagingRoot)) {
+                workspaces = paths.filter(Files::isDirectory).toList();
+            }
+            for (Path workspace : workspaces) {
+                reconcileWorkspace(workspace, repository);
+            }
+        }
+
+        @Override
         public StagedSource stage(InputStream source) throws IOException {
             Files.createDirectories(storageRoot);
             Path staged = Files.createTempFile(storageRoot, "upload-", ".epub");
+            return stageToPath(source, staged);
+        }
+
+        private StagedSource stageToPath(InputStream source, Path staged) throws IOException {
             try {
                 MessageDigest digest = sha256Digest();
                 try (OutputStream output = Files.newOutputStream(
-                        staged, StandardOpenOption.TRUNCATE_EXISTING)) {
+                        staged, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
                     byte[] buffer = new byte[8192];
                     int read;
                     while ((read = source.read(buffer)) != -1) {
@@ -410,11 +592,8 @@ public class EpubImportService {
         @Override
         public String storeSource(Path stagedSource, String originalFilename, String sourceSha256)
                 throws IOException {
-            Path targetDirectory = storageRoot.resolve("sources").normalize();
-            String uniqueSuffix = UUID.randomUUID().toString().replace("-", "");
-            Path target = targetDirectory.resolve(
-                    sourceSha256 + "-" + uniqueSuffix + "-" + sanitizeFilename(originalFilename)).normalize();
-            ensureWithinRoot(target);
+            Path target = sourceTarget(originalFilename, sourceSha256);
+            Path targetDirectory = target.getParent();
             Files.createDirectories(targetDirectory);
             move(stagedSource, target);
             return target.toString();
@@ -423,13 +602,16 @@ public class EpubImportService {
         @Override
         public String storeChapterText(long bookId, long bookVersionId, int chapterNumber, String text)
                 throws IOException {
-            Path directory = storageRoot.resolve("books").resolve(Long.toString(bookId))
-                    .resolve("versions").resolve(Long.toString(bookVersionId)).resolve("chapters").normalize();
-            Path target = directory.resolve(chapterNumber + ".txt").normalize();
-            ensureWithinRoot(target);
+            Path target = chapterTarget(bookId, bookVersionId, chapterNumber);
+            Path directory = target.getParent();
             Files.createDirectories(directory);
-            Files.writeString(target, text, StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            try {
+                Files.writeString(target, text, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (IOException exception) {
+                Files.deleteIfExists(target);
+                throw exception;
+            }
             return target.toString();
         }
 
@@ -446,11 +628,488 @@ public class EpubImportService {
             }
         }
 
+        private Path sourceTarget(String originalFilename, String sourceSha256) {
+            Path targetDirectory = storageRoot.resolve("sources").normalize();
+            String uniqueSuffix = UUID.randomUUID().toString().replace("-", "");
+            Path target = targetDirectory.resolve(
+                    sourceSha256 + "-" + uniqueSuffix + "-" + sanitizeFilename(originalFilename)).normalize();
+            ensureWithinRoot(target);
+            return target;
+        }
+
+        private Path chapterTarget(long bookId, long bookVersionId, int chapterNumber) {
+            Path directory = storageRoot.resolve("books").resolve(Long.toString(bookId))
+                    .resolve("versions").resolve(Long.toString(bookVersionId)).resolve("chapters").normalize();
+            Path target = directory.resolve(chapterNumber + ".txt").normalize();
+            ensureWithinRoot(target);
+            return target;
+        }
+
         private void move(Path source, Path target) throws IOException {
             try {
                 Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
             } catch (AtomicMoveNotSupportedException exception) {
                 Files.move(source, target);
+            }
+        }
+
+        private void replace(Path source, Path target) throws IOException {
+            try {
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException exception) {
+                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
+        private void reconcileWorkspace(Path workspaceDirectory, BookRepository repository)
+                throws IOException {
+            Path normalizedWorkspace = workspaceDirectory.toAbsolutePath().normalize();
+            Path stagingRoot = storageRoot.resolve(STAGING_DIRECTORY_NAME).normalize();
+            if (!normalizedWorkspace.getParent().equals(stagingRoot)
+                    || !normalizedWorkspace.getFileName().toString().startsWith("import-")) {
+                return;
+            }
+
+            ProcessLock processLock = tryAcquireProcessLock(
+                    normalizedWorkspace.resolve(LOCK_FILENAME));
+            if (processLock == null) {
+                return;
+            }
+
+            boolean removeWorkspace = false;
+            try {
+                Path journalPath = normalizedWorkspace.resolve(JOURNAL_FILENAME);
+                if (!Files.isRegularFile(journalPath)) {
+                    removeWorkspace = true;
+                } else {
+                    Properties journal = loadJournal(journalPath);
+                    List<Mapping> mappings = readMappings(journal, normalizedWorkspace);
+                    String sourceSha256 = journal.getProperty("sourceSha256", "").trim();
+                    long bookVersionId = parseLong(journal, "bookVersionId");
+                    String state = journal.getProperty("state", "");
+                    Optional<StoredBookVersion> storedVersion = sourceSha256.matches(
+                            "[0-9a-fA-F]{64}") && bookVersionId > 0
+                            ? repository.findBySourceSha256(sourceSha256)
+                            : Optional.empty();
+                    boolean ownsStoredVersion = storedVersion.isPresent()
+                            && storedVersion.get().bookVersionId() == bookVersionId
+                            && sourceMappingMatches(mappings, storedVersion.get());
+                    if (STATE_ABORTED.equals(state) || !ownsStoredVersion) {
+                        deleteFinalMappings(mappings);
+                    } else {
+                        promoteMappings(mappings);
+                    }
+                    removeWorkspace = true;
+                }
+            } finally {
+                processLock.close();
+            }
+            if (removeWorkspace) {
+                deleteRecursively(normalizedWorkspace);
+            }
+        }
+
+        private Properties loadJournal(Path journalPath) throws IOException {
+            Properties journal = new Properties();
+            try (InputStream input = Files.newInputStream(journalPath)) {
+                journal.load(input);
+            }
+            return journal;
+        }
+
+        private List<Mapping> readMappings(Properties journal, Path workspaceDirectory)
+                throws IOException {
+            int count;
+            try {
+                count = Integer.parseInt(journal.getProperty("mapping.count", "0"));
+            } catch (NumberFormatException exception) {
+                throw new IOException("Invalid EPUB import journal mapping count", exception);
+            }
+            if (count < 0 || count > 100_000) {
+                throw new IOException("Invalid EPUB import journal mapping count");
+            }
+            List<Mapping> mappings = new ArrayList<>(count);
+            for (int index = 0; index < count; index++) {
+                String stagingPath = journal.getProperty("mapping." + index + ".staging");
+                String finalPath = journal.getProperty("mapping." + index + ".final");
+                if (stagingPath == null || finalPath == null) {
+                    throw new IOException("Incomplete EPUB import journal mapping");
+                }
+                Path staging = Path.of(stagingPath).toAbsolutePath().normalize();
+                Path target = Path.of(finalPath).toAbsolutePath().normalize();
+                ensureWithinWorkspace(staging, workspaceDirectory);
+                ensureFileWithinRoot(target);
+                mappings.add(new Mapping(staging, target));
+            }
+            return List.copyOf(mappings);
+        }
+
+        private long parseLong(Properties journal, String key) throws IOException {
+            String value = journal.getProperty(key, "0");
+            try {
+                return Long.parseLong(value);
+            } catch (NumberFormatException exception) {
+                throw new IOException("Invalid EPUB import journal value: " + key, exception);
+            }
+        }
+
+        private boolean sourceMappingMatches(List<Mapping> mappings, StoredBookVersion version) {
+            if (mappings.isEmpty()) {
+                return false;
+            }
+            try {
+                Path storedSource = Path.of(version.sourceFilePath()).toAbsolutePath().normalize();
+                return mappings.get(0).finalPath().equals(storedSource);
+            } catch (RuntimeException exception) {
+                return false;
+            }
+        }
+
+        private void promoteMappings(List<Mapping> mappings) throws IOException {
+            for (Mapping mapping : mappings) {
+                ensureFileWithinRoot(mapping.finalPath());
+                if (Files.exists(mapping.stagingPath())) {
+                    Files.createDirectories(mapping.finalPath().getParent());
+                    if (Files.exists(mapping.finalPath())) {
+                        if (Files.mismatch(mapping.stagingPath(), mapping.finalPath()) != -1) {
+                            throw new IOException(
+                                    "EPUB import promotion target already contains different content: "
+                                            + mapping.finalPath());
+                        }
+                        Files.deleteIfExists(mapping.stagingPath());
+                    } else {
+                        move(mapping.stagingPath(), mapping.finalPath());
+                    }
+                } else if (!Files.exists(mapping.finalPath())) {
+                    throw new IOException(
+                            "EPUB import staging file is missing: " + mapping.stagingPath());
+                }
+            }
+        }
+
+        private void deleteFinalMappings(List<Mapping> mappings) throws IOException {
+            IOException firstFailure = null;
+            for (Mapping mapping : mappings) {
+                try {
+                    ensureFileWithinRoot(mapping.finalPath());
+                    Files.deleteIfExists(mapping.finalPath());
+                } catch (IOException | RuntimeException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception instanceof IOException ioException
+                                ? ioException
+                                : new IOException(exception);
+                    }
+                }
+            }
+            if (firstFailure != null) {
+                throw firstFailure;
+            }
+        }
+
+        private void ensureFileWithinRoot(Path path) {
+            Path normalized = path.toAbsolutePath().normalize();
+            if (!normalized.startsWith(storageRoot) || normalized.equals(storageRoot)) {
+                throw new IllegalArgumentException("Storage path escapes storage root: " + path);
+            }
+        }
+
+        private void ensureWithinWorkspace(Path path, Path workspaceDirectory) throws IOException {
+            Path normalized = path.toAbsolutePath().normalize();
+            Path workspace = workspaceDirectory.toAbsolutePath().normalize();
+            if (!normalized.startsWith(workspace) || normalized.equals(workspace)) {
+                throw new IOException("EPUB import journal staging path escapes its workspace: " + path);
+            }
+        }
+
+        private ProcessLock tryAcquireProcessLock(Path lockPath) throws IOException {
+            Files.createDirectories(lockPath.getParent());
+            FileChannel channel = FileChannel.open(lockPath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            try {
+                FileLock lock = channel.tryLock();
+                if (lock == null) {
+                    channel.close();
+                    return null;
+                }
+                return new ProcessLock(channel, lock);
+            } catch (OverlappingFileLockException exception) {
+                channel.close();
+                return null;
+            } catch (IOException | RuntimeException exception) {
+                channel.close();
+                throw exception;
+            }
+        }
+
+        private void writeJournalFile(Path journalPath, Properties properties) throws IOException {
+            Path temporary = journalPath.resolveSibling(JOURNAL_FILENAME + ".tmp");
+            try {
+                try (OutputStream output = Files.newOutputStream(
+                        temporary, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE)) {
+                    properties.store(output, "audiobook-factory EPUB import journal");
+                }
+                forceFile(temporary);
+                replace(temporary, journalPath);
+                forceFile(journalPath);
+            } catch (IOException | RuntimeException exception) {
+                Files.deleteIfExists(temporary);
+                throw exception;
+            }
+        }
+
+        private void forceFile(Path path) throws IOException {
+            try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+                channel.force(true);
+            }
+        }
+
+        private void deleteRecursively(Path directory) throws IOException {
+            if (!Files.exists(directory)) {
+                return;
+            }
+            List<Path> paths;
+            try (Stream<Path> stream = Files.walk(directory)) {
+                paths = stream.sorted(Comparator.reverseOrder()).toList();
+            }
+            IOException firstFailure = null;
+            for (Path path : paths) {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception;
+                    }
+                }
+            }
+            if (firstFailure != null) {
+                throw firstFailure;
+            }
+        }
+
+        private record Mapping(Path stagingPath, Path finalPath) {
+        }
+
+        private static final class ProcessLock implements AutoCloseable {
+
+            private final FileChannel channel;
+            private final FileLock lock;
+            private boolean closed;
+
+            private ProcessLock(FileChannel channel, FileLock lock) {
+                this.channel = channel;
+                this.lock = lock;
+            }
+
+            @Override
+            public void close() throws IOException {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                IOException firstFailure = null;
+                try {
+                    lock.release();
+                } catch (IOException exception) {
+                    firstFailure = exception;
+                }
+                try {
+                    channel.close();
+                } catch (IOException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception;
+                    }
+                }
+                if (firstFailure != null) {
+                    throw firstFailure;
+                }
+            }
+        }
+
+        private static final class FileImportWorkspace implements ImportWorkspace {
+
+            private final FileBookStorage storage;
+            private final Path workspaceDirectory;
+            private final Path journalPath;
+            private final List<Mapping> mappings = new ArrayList<>();
+            private ProcessLock processLock;
+            private String sourceSha256;
+            private long bookId;
+            private long bookVersionId;
+            private String state = STATE_PREPARED;
+            private boolean databaseCommitted;
+            private boolean aborted;
+
+            private FileImportWorkspace(FileBookStorage storage) throws IOException {
+                this.storage = storage;
+                Path stagingRoot = storage.storageRoot.resolve(STAGING_DIRECTORY_NAME).normalize();
+                Files.createDirectories(stagingRoot);
+                this.workspaceDirectory = stagingRoot.resolve(
+                        "import-" + UUID.randomUUID().toString().replace("-", "")).normalize();
+                storage.ensureWithinRoot(workspaceDirectory);
+                Files.createDirectories(workspaceDirectory);
+                this.journalPath = workspaceDirectory.resolve(JOURNAL_FILENAME);
+                this.processLock = storage.tryAcquireProcessLock(
+                        workspaceDirectory.resolve(LOCK_FILENAME));
+                if (processLock == null) {
+                    throw new IOException("Unable to lock EPUB import workspace");
+                }
+                try {
+                    persistJournal();
+                } catch (IOException | RuntimeException exception) {
+                    processLock.close();
+                    processLock = null;
+                    storage.deleteRecursively(workspaceDirectory);
+                    throw exception;
+                }
+            }
+
+            @Override
+            public StagedSource stage(InputStream source) throws IOException {
+                Path stagedPath = workspaceDirectory.resolve("upload.epub");
+                StagedSource staged = storage.stageToPath(source, stagedPath);
+                sourceSha256 = staged.sha256();
+                persistJournal();
+                return staged;
+            }
+
+            @Override
+            public String storeSource(Path stagedSource, String originalFilename, String sourceSha256)
+                    throws IOException {
+                Path sourcePath = storage.sourceTarget(originalFilename, sourceSha256);
+                registerMapping(stagedSource, sourcePath);
+                return sourcePath.toString();
+            }
+
+            @Override
+            public String storeChapterText(long bookId, long bookVersionId, int chapterNumber, String text)
+                    throws IOException {
+                Path stagedPath = workspaceDirectory.resolve("chapter-" + chapterNumber + ".txt");
+                Path finalPath = storage.chapterTarget(bookId, bookVersionId, chapterNumber);
+                registerMapping(stagedPath, finalPath);
+                Files.writeString(stagedPath, text, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                return finalPath.toString();
+            }
+
+            @Override
+            public void recordBookVersion(long bookId, long bookVersionId) throws IOException {
+                if (bookId <= 0 || bookVersionId <= 0) {
+                    throw new IllegalArgumentException("book and book version ids must be positive");
+                }
+                this.bookId = bookId;
+                this.bookVersionId = bookVersionId;
+                persistJournal();
+            }
+
+            @Override
+            public void databaseCommitted() throws IOException {
+                if (bookVersionId <= 0) {
+                    throw new IllegalStateException("EPUB import has no recorded book version");
+                }
+                databaseCommitted = true;
+                state = STATE_DB_COMMITTED;
+                persistJournal();
+            }
+
+            @Override
+            public void promote() throws IOException {
+                if (!databaseCommitted) {
+                    throw new IllegalStateException("EPUB import database transaction is not committed");
+                }
+                state = STATE_PROMOTING;
+                persistJournal();
+                storage.promoteMappings(mappings);
+                state = STATE_PROMOTED;
+                persistJournal();
+            }
+
+            @Override
+            public void finish() throws IOException {
+                close();
+                storage.deleteRecursively(workspaceDirectory);
+            }
+
+            @Override
+            public void abort() throws IOException {
+                if (aborted || databaseCommitted) {
+                    return;
+                }
+                aborted = true;
+                IOException firstFailure = null;
+                try {
+                    state = STATE_ABORTED;
+                    persistJournal();
+                } catch (IOException | RuntimeException exception) {
+                    firstFailure = exception instanceof IOException ioException
+                            ? ioException
+                            : new IOException(exception);
+                }
+                try {
+                    storage.deleteFinalMappings(mappings);
+                } catch (IOException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception;
+                    }
+                }
+                try {
+                    close();
+                } catch (IOException exception) {
+                    if (firstFailure == null) {
+                        firstFailure = exception;
+                    }
+                }
+                if (firstFailure == null) {
+                    try {
+                        storage.deleteRecursively(workspaceDirectory);
+                    } catch (IOException exception) {
+                        firstFailure = exception;
+                    }
+                }
+                if (firstFailure != null) {
+                    throw firstFailure;
+                }
+            }
+
+            @Override
+            public void close() throws IOException {
+                if (processLock != null) {
+                    ProcessLock lock = processLock;
+                    processLock = null;
+                    lock.close();
+                }
+            }
+
+            private void registerMapping(Path stagingPath, Path finalPath) throws IOException {
+                Path normalizedStaging = stagingPath.toAbsolutePath().normalize();
+                Path normalizedFinal = finalPath.toAbsolutePath().normalize();
+                storage.ensureWithinRoot(normalizedStaging);
+                storage.ensureWithinRoot(normalizedFinal);
+                storage.ensureWithinWorkspace(normalizedStaging, workspaceDirectory);
+                storage.ensureFileWithinRoot(normalizedFinal);
+                mappings.add(new Mapping(normalizedStaging, normalizedFinal));
+                persistJournal();
+            }
+
+            private void persistJournal() throws IOException {
+                Properties journal = new Properties();
+                journal.setProperty("formatVersion", "1");
+                journal.setProperty("state", state);
+                if (sourceSha256 != null) {
+                    journal.setProperty("sourceSha256", sourceSha256);
+                }
+                journal.setProperty("bookId", Long.toString(bookId));
+                journal.setProperty("bookVersionId", Long.toString(bookVersionId));
+                journal.setProperty("mapping.count", Integer.toString(mappings.size()));
+                for (int index = 0; index < mappings.size(); index++) {
+                    Mapping mapping = mappings.get(index);
+                    journal.setProperty("mapping." + index + ".staging",
+                            mapping.stagingPath().toString());
+                    journal.setProperty("mapping." + index + ".final",
+                            mapping.finalPath().toString());
+                }
+                storage.writeJournalFile(journalPath, journal);
             }
         }
 

@@ -295,7 +295,7 @@ public class EpubChapterExtractor {
     private ChapterDraft extractChapter(byte[] xhtml, int chapterNumber) throws IOException {
         Document document = Jsoup.parse(
                 new ByteArrayInputStream(xhtml),
-                StandardCharsets.UTF_8.name(),
+                null,
                 "",
                 Parser.xmlParser());
         Element body = document.selectFirst("body");

@@ -35,6 +35,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -43,6 +44,9 @@ public class EpubImportService {
 
     public static final long DEFAULT_MAX_SOURCE_BYTES = 256L * 1024 * 1024;
     public static final String EPUB_SOURCE_TOO_LARGE = "EPUB_SOURCE_TOO_LARGE";
+    public static final String EPUB_IMPORT_RECOVERY_UNAVAILABLE =
+            "EPUB_IMPORT_RECOVERY_UNAVAILABLE";
+    public static final String EPUB_IMPORT_RECOVERY_FAILED = "EPUB_IMPORT_RECOVERY_FAILED";
 
     private static final String PARSER_VERSION = "v1";
     private static final String PRESET_SNAPSHOT = "{}";
@@ -522,6 +526,13 @@ public class EpubImportService {
         }
     }
 
+    interface AtomicFileOperations {
+
+        void moveAtomically(Path source, Path target) throws IOException;
+
+        void replaceAtomically(Path source, Path target) throws IOException;
+    }
+
     public static final class FileBookStorage implements BookStorage {
 
         private static final String STAGING_DIRECTORY_NAME = "staging";
@@ -533,11 +544,32 @@ public class EpubImportService {
         private static final String STATE_PROMOTED = "PROMOTED";
         private static final String STATE_ABORTED = "ABORTED";
 
+        private static final class DefaultAtomicFileOperations implements AtomicFileOperations {
+
+            @Override
+            public void moveAtomically(Path source, Path target) throws IOException {
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+            }
+
+            @Override
+            public void replaceAtomically(Path source, Path target) throws IOException {
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
         private final Path storageRoot;
+        private final AtomicFileOperations fileOperations;
 
         public FileBookStorage(Path storageRoot) {
+            this(storageRoot, new DefaultAtomicFileOperations());
+        }
+
+        FileBookStorage(Path storageRoot, AtomicFileOperations fileOperations) {
             this.storageRoot = Objects.requireNonNull(storageRoot, "storageRoot must not be null")
                     .toAbsolutePath().normalize();
+            this.fileOperations = Objects.requireNonNull(fileOperations,
+                    "fileOperations must not be null");
         }
 
         @Override
@@ -647,18 +679,21 @@ public class EpubImportService {
 
         private void move(Path source, Path target) throws IOException {
             try {
-                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+                fileOperations.moveAtomically(source, target);
             } catch (AtomicMoveNotSupportedException exception) {
-                Files.move(source, target);
+                throw new EpubImportException(
+                        EPUB_IMPORT_RECOVERY_UNAVAILABLE,
+                        "Atomic EPUB file promotion is not supported by the storage filesystem", exception);
             }
         }
 
         private void replace(Path source, Path target) throws IOException {
             try {
-                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING);
+                fileOperations.replaceAtomically(source, target);
             } catch (AtomicMoveNotSupportedException exception) {
-                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+                throw new EpubImportException(
+                        EPUB_IMPORT_RECOVERY_UNAVAILABLE,
+                        "Atomic EPUB journal replacement is not supported by the storage filesystem", exception);
             }
         }
 
@@ -681,27 +716,78 @@ public class EpubImportService {
             try {
                 Path journalPath = normalizedWorkspace.resolve(JOURNAL_FILENAME);
                 if (!Files.isRegularFile(journalPath)) {
-                    removeWorkspace = true;
-                } else {
-                    Properties journal = loadJournal(journalPath);
-                    List<Mapping> mappings = readMappings(journal, normalizedWorkspace);
-                    String sourceSha256 = journal.getProperty("sourceSha256", "").trim();
-                    long bookVersionId = parseLong(journal, "bookVersionId");
-                    String state = journal.getProperty("state", "");
-                    Optional<StoredBookVersion> storedVersion = sourceSha256.matches(
-                            "[0-9a-fA-F]{64}") && bookVersionId > 0
-                            ? repository.findBySourceSha256(sourceSha256)
-                            : Optional.empty();
-                    boolean ownsStoredVersion = storedVersion.isPresent()
-                            && storedVersion.get().bookVersionId() == bookVersionId
-                            && sourceMappingMatches(mappings, storedVersion.get());
-                    if (STATE_ABORTED.equals(state) || !ownsStoredVersion) {
-                        deleteFinalMappings(mappings);
-                    } else {
-                        promoteMappings(mappings);
-                    }
-                    removeWorkspace = true;
+                    throw recoveryFailed(
+                            "EPUB import journal is missing; staging evidence was retained: " + journalPath);
                 }
+
+                Properties journal;
+                try {
+                    journal = loadJournal(journalPath);
+                } catch (IOException | RuntimeException exception) {
+                    throw recoveryFailed(
+                            "Unable to read EPUB import journal; staging evidence was retained: "
+                                    + journalPath,
+                            exception);
+                }
+                String formatVersion = requiredJournalProperty(journal, "formatVersion");
+                if (!"1".equals(formatVersion)) {
+                    throw recoveryFailed("Unsupported EPUB import journal format: " + formatVersion);
+                }
+                String state = requiredJournalProperty(journal, "state");
+                if (!Set.of(STATE_PREPARED, STATE_DB_COMMITTED, STATE_PROMOTING,
+                        STATE_PROMOTED, STATE_ABORTED).contains(state)) {
+                    throw recoveryFailed("Unknown EPUB import journal state: " + state);
+                }
+                long bookId = parseLong(journal, "bookId");
+                long bookVersionId = parseLong(journal, "bookVersionId");
+                if (bookId < 0 || bookVersionId < 0) {
+                    throw recoveryFailed("EPUB import journal contains a negative identifier");
+                }
+                List<Mapping> mappings = readMappings(journal, normalizedWorkspace);
+                String sourceSha256 = journal.getProperty("sourceSha256", "").trim();
+                if (!sourceSha256.isEmpty() && !sourceSha256.matches("[0-9a-fA-F]{64}")) {
+                    throw recoveryFailed("Invalid EPUB import journal source SHA-256");
+                }
+                if (!mappings.isEmpty() && sourceSha256.isEmpty()) {
+                    throw recoveryFailed("EPUB import journal has mappings but no source SHA-256");
+                }
+                if (!mappings.isEmpty()
+                        && !sourceSha256.equalsIgnoreCase(mappings.get(0).expectedSha256())) {
+                    throw recoveryFailed("EPUB import journal source mapping hash does not match source SHA-256");
+                }
+                if ((STATE_DB_COMMITTED.equals(state) || STATE_PROMOTING.equals(state)
+                        || STATE_PROMOTED.equals(state)) && bookVersionId <= 0) {
+                    throw recoveryFailed("Committed EPUB import journal has no book version ID");
+                }
+                if (bookVersionId > 0 && mappings.isEmpty()) {
+                    throw recoveryFailed("Committed EPUB import journal has no file mappings");
+                }
+                if (bookVersionId > 0 && bookId <= 0) {
+                    throw recoveryFailed("Committed EPUB import journal has no book ID");
+                }
+                validateChapterMappingTargets(mappings, bookId, bookVersionId);
+
+                Optional<StoredBookVersion> storedVersion = sourceSha256.matches(
+                        "[0-9a-fA-F]{64}") && bookVersionId > 0
+                        ? repository.findBySourceSha256(sourceSha256)
+                        : Optional.empty();
+                boolean ownsStoredVersion = storedVersion.isPresent()
+                        && storedVersion.get().bookId() == bookId
+                        && storedVersion.get().bookVersionId() == bookVersionId
+                        && sourceSha256.equalsIgnoreCase(storedVersion.get().sourceSha256())
+                        && sourceMappingMatches(mappings, storedVersion.get());
+                if (ownsStoredVersion
+                        && mappings.size() != (long) storedVersion.get().chapterCount() + 1) {
+                    throw recoveryFailed("EPUB import journal file mapping count does not match the database");
+                }
+                if (!ownsStoredVersion) {
+                    deleteFinalMappings(mappings);
+                } else {
+                    promoteMappings(mappings);
+                    journal.setProperty("state", STATE_PROMOTED);
+                    writeJournalFile(journalPath, journal);
+                }
+                removeWorkspace = true;
             } finally {
                 processLock.close();
             }
@@ -722,36 +808,77 @@ public class EpubImportService {
                 throws IOException {
             int count;
             try {
-                count = Integer.parseInt(journal.getProperty("mapping.count", "0"));
+                count = Integer.parseInt(requiredJournalProperty(journal, "mapping.count"));
             } catch (NumberFormatException exception) {
-                throw new IOException("Invalid EPUB import journal mapping count", exception);
+                throw recoveryFailed("Invalid EPUB import journal mapping count", exception);
             }
             if (count < 0 || count > 100_000) {
-                throw new IOException("Invalid EPUB import journal mapping count");
+                throw recoveryFailed("Invalid EPUB import journal mapping count");
             }
             List<Mapping> mappings = new ArrayList<>(count);
             for (int index = 0; index < count; index++) {
                 String stagingPath = journal.getProperty("mapping." + index + ".staging");
                 String finalPath = journal.getProperty("mapping." + index + ".final");
-                if (stagingPath == null || finalPath == null) {
-                    throw new IOException("Incomplete EPUB import journal mapping");
+                String sizeValue = journal.getProperty("mapping." + index + ".size");
+                String expectedSha256 = journal.getProperty("mapping." + index + ".sha256");
+                if (stagingPath == null || finalPath == null || sizeValue == null || expectedSha256 == null) {
+                    throw recoveryFailed("Incomplete EPUB import journal mapping");
                 }
-                Path staging = Path.of(stagingPath).toAbsolutePath().normalize();
-                Path target = Path.of(finalPath).toAbsolutePath().normalize();
-                ensureWithinWorkspace(staging, workspaceDirectory);
-                ensureFileWithinRoot(target);
-                mappings.add(new Mapping(staging, target));
+                long expectedSize;
+                try {
+                    expectedSize = Long.parseLong(sizeValue);
+                } catch (NumberFormatException exception) {
+                    throw recoveryFailed("Invalid EPUB import journal mapping size", exception);
+                }
+                if (expectedSize < 0 || !expectedSha256.matches("[0-9a-fA-F]{64}")) {
+                    throw recoveryFailed("Invalid EPUB import journal mapping metadata");
+                }
+                try {
+                    Path staging = Path.of(stagingPath).toAbsolutePath().normalize();
+                    Path target = Path.of(finalPath).toAbsolutePath().normalize();
+                    ensureWithinWorkspace(staging, workspaceDirectory);
+                    ensureFileWithinRoot(target);
+                    mappings.add(new Mapping(
+                            staging, target, expectedSize, expectedSha256.toLowerCase(Locale.ROOT)));
+                } catch (IOException | RuntimeException exception) {
+                    if (exception instanceof EpubImportException epubImportException) {
+                        throw epubImportException;
+                    }
+                    throw recoveryFailed("Invalid EPUB import journal mapping path", exception);
+                }
             }
             return List.copyOf(mappings);
         }
 
+        private void validateChapterMappingTargets(List<Mapping> mappings, long bookId, long bookVersionId) {
+            if (bookVersionId <= 0) {
+                return;
+            }
+            for (int index = 1; index < mappings.size(); index++) {
+                Path expected = chapterTarget(bookId, bookVersionId, index);
+                if (!expected.equals(mappings.get(index).finalPath())) {
+                    throw recoveryFailed(
+                            "EPUB import journal chapter mapping does not match its book version: "
+                                    + mappings.get(index).finalPath());
+                }
+            }
+        }
+
         private long parseLong(Properties journal, String key) throws IOException {
-            String value = journal.getProperty(key, "0");
+            String value = requiredJournalProperty(journal, key);
             try {
                 return Long.parseLong(value);
             } catch (NumberFormatException exception) {
-                throw new IOException("Invalid EPUB import journal value: " + key, exception);
+                throw recoveryFailed("Invalid EPUB import journal value: " + key, exception);
             }
+        }
+
+        private String requiredJournalProperty(Properties journal, String key) {
+            String value = journal.getProperty(key);
+            if (value == null || value.isBlank()) {
+                throw recoveryFailed("Incomplete EPUB import journal; missing " + key);
+            }
+            return value.trim();
         }
 
         private boolean sourceMappingMatches(List<Mapping> mappings, StoredBookVersion version) {
@@ -769,22 +896,61 @@ public class EpubImportService {
         private void promoteMappings(List<Mapping> mappings) throws IOException {
             for (Mapping mapping : mappings) {
                 ensureFileWithinRoot(mapping.finalPath());
-                if (Files.exists(mapping.stagingPath())) {
-                    Files.createDirectories(mapping.finalPath().getParent());
-                    if (Files.exists(mapping.finalPath())) {
-                        if (Files.mismatch(mapping.stagingPath(), mapping.finalPath()) != -1) {
-                            throw new IOException(
-                                    "EPUB import promotion target already contains different content: "
-                                            + mapping.finalPath());
+                boolean stagingExists = Files.exists(mapping.stagingPath());
+                boolean finalExists = Files.exists(mapping.finalPath());
+                if (stagingExists) {
+                    verifyMappingFile(mapping.stagingPath(), mapping, "staging");
+                    if (finalExists) {
+                        verifyMappingFile(mapping.finalPath(), mapping, "final");
+                        try {
+                            Files.deleteIfExists(mapping.stagingPath());
+                        } catch (IOException exception) {
+                            throw recoveryFailed(
+                                    "Unable to remove the verified EPUB staging file: "
+                                            + mapping.stagingPath(), exception);
                         }
-                        Files.deleteIfExists(mapping.stagingPath());
                     } else {
-                        move(mapping.stagingPath(), mapping.finalPath());
+                        try {
+                            Files.createDirectories(mapping.finalPath().getParent());
+                            move(mapping.stagingPath(), mapping.finalPath());
+                        } catch (EpubImportException exception) {
+                            throw exception;
+                        } catch (IOException exception) {
+                            throw recoveryFailed(
+                                    "Unable to atomically promote EPUB file: " + mapping.stagingPath(),
+                                    exception);
+                        }
+                        verifyMappingFile(mapping.finalPath(), mapping, "final");
                     }
-                } else if (!Files.exists(mapping.finalPath())) {
-                    throw new IOException(
-                            "EPUB import staging file is missing: " + mapping.stagingPath());
+                } else if (finalExists) {
+                    verifyMappingFile(mapping.finalPath(), mapping, "final");
+                } else {
+                    throw recoveryFailed(
+                            "EPUB import mapping has neither a staging file nor a final file: "
+                                    + mapping.stagingPath());
                 }
+            }
+        }
+
+        private void verifyMappingFile(Path path, Mapping mapping, String location) {
+            if (!Files.isRegularFile(path)) {
+                throw recoveryFailed(
+                        "EPUB import " + location + " file is missing or not a regular file: " + path);
+            }
+            try {
+                long actualSize = Files.size(path);
+                if (actualSize != mapping.expectedSize()) {
+                    throw recoveryFailed(
+                            "EPUB import " + location + " file size does not match its journal: " + path);
+                }
+                String actualSha256 = sha256File(path);
+                if (!mapping.expectedSha256().equalsIgnoreCase(actualSha256)) {
+                    throw recoveryFailed(
+                            "EPUB import " + location + " file SHA-256 does not match its journal: " + path);
+                }
+            } catch (IOException exception) {
+                throw recoveryFailed(
+                        "Unable to verify EPUB import " + location + " file: " + path, exception);
             }
         }
 
@@ -888,7 +1054,29 @@ public class EpubImportService {
             }
         }
 
-        private record Mapping(Path stagingPath, Path finalPath) {
+        private String sha256File(Path path) throws IOException {
+            MessageDigest digest = sha256Digest();
+            try (InputStream input = Files.newInputStream(path)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    if (read > 0) {
+                        digest.update(buffer, 0, read);
+                    }
+                }
+            }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        }
+
+        private EpubImportException recoveryFailed(String message) {
+            return new EpubImportException(EPUB_IMPORT_RECOVERY_FAILED, message);
+        }
+
+        private EpubImportException recoveryFailed(String message, Throwable cause) {
+            return new EpubImportException(EPUB_IMPORT_RECOVERY_FAILED, message, cause);
+        }
+
+        private record Mapping(Path stagingPath, Path finalPath, long expectedSize, String expectedSha256) {
         }
 
         private static final class ProcessLock implements AutoCloseable {
@@ -978,7 +1166,11 @@ public class EpubImportService {
             public String storeSource(Path stagedSource, String originalFilename, String sourceSha256)
                     throws IOException {
                 Path sourcePath = storage.sourceTarget(originalFilename, sourceSha256);
-                registerMapping(stagedSource, sourcePath);
+                String actualSha256 = storage.sha256File(stagedSource);
+                if (!actualSha256.equalsIgnoreCase(sourceSha256)) {
+                    throw new IOException("EPUB source SHA-256 changed while it was staged");
+                }
+                registerMapping(stagedSource, sourcePath, Files.size(stagedSource), actualSha256);
                 return sourcePath.toString();
             }
 
@@ -987,8 +1179,9 @@ public class EpubImportService {
                     throws IOException {
                 Path stagedPath = workspaceDirectory.resolve("chapter-" + chapterNumber + ".txt");
                 Path finalPath = storage.chapterTarget(bookId, bookVersionId, chapterNumber);
-                registerMapping(stagedPath, finalPath);
-                Files.writeString(stagedPath, text, StandardCharsets.UTF_8,
+                byte[] encodedText = text.getBytes(StandardCharsets.UTF_8);
+                registerMapping(stagedPath, finalPath, encodedText.length, BookHashing.sha256(encodedText));
+                Files.write(stagedPath, encodedText,
                         StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
                 return finalPath.toString();
             }
@@ -1081,14 +1274,15 @@ public class EpubImportService {
                 }
             }
 
-            private void registerMapping(Path stagingPath, Path finalPath) throws IOException {
+            private void registerMapping(Path stagingPath, Path finalPath,
+                                         long expectedSize, String expectedSha256) throws IOException {
                 Path normalizedStaging = stagingPath.toAbsolutePath().normalize();
                 Path normalizedFinal = finalPath.toAbsolutePath().normalize();
                 storage.ensureWithinRoot(normalizedStaging);
                 storage.ensureWithinRoot(normalizedFinal);
                 storage.ensureWithinWorkspace(normalizedStaging, workspaceDirectory);
                 storage.ensureFileWithinRoot(normalizedFinal);
-                mappings.add(new Mapping(normalizedStaging, normalizedFinal));
+                mappings.add(new Mapping(normalizedStaging, normalizedFinal, expectedSize, expectedSha256));
                 persistJournal();
             }
 
@@ -1108,6 +1302,9 @@ public class EpubImportService {
                             mapping.stagingPath().toString());
                     journal.setProperty("mapping." + index + ".final",
                             mapping.finalPath().toString());
+                    journal.setProperty("mapping." + index + ".size",
+                            Long.toString(mapping.expectedSize()));
+                    journal.setProperty("mapping." + index + ".sha256", mapping.expectedSha256());
                 }
                 storage.writeJournalFile(journalPath, journal);
             }

@@ -1,0 +1,28 @@
+# User uploads and generated runtime data
+upload/
+data/
+runtime/
+logs/
+.worktrees/
+*.wav
+*.mp3
+*.m4b
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Java / Python / frontend build outputs
+target/
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+dist/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -29,6 +29,14 @@ class RecordingTransport:
         return response
 
 
+class OneChunkStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes):
+        self.content = content
+
+    async def __aiter__(self):
+        yield self.content
+
+
 def make_client(transport):
     return ControlPlaneClient(
         "https://factory.example",
@@ -61,6 +69,30 @@ def test_claim_job_sends_bearer_token():
     assert request.headers["Authorization"] == "Bearer worker-token"
     assert job.job_id == "job-1"
     assert job.text == "测试"
+
+
+def test_control_plane_requires_https_for_non_local_hosts():
+    with pytest.raises(ValueError, match="HTTPS"):
+        ControlPlaneClient("http://factory.example", "worker-token")
+
+    assert ControlPlaneClient("http://localhost:8080", "worker-token")
+    assert ControlPlaneClient("http://127.0.0.1:8080", "worker-token")
+
+
+def test_control_plane_rejects_token_in_base_url():
+    with pytest.raises(ValueError, match="URL"):
+        ControlPlaneClient(
+            "https://factory.example/api?access_token=worker-token",
+            "worker-token",
+        )
+
+
+@pytest.mark.parametrize("job_id", ["", ".", "..", "../job-1", "nested/job", "任务-1"])
+def test_job_id_must_be_a_safe_ascii_path_component(job_id):
+    client = ControlPlaneClient("https://factory.example", "worker-token")
+
+    with pytest.raises(ValueError, match="job_id"):
+        run_async(client.heartbeat(job_id, {"phase": "generating"}))
 
 
 def test_claim_job_returns_none_for_no_work():
@@ -153,6 +185,25 @@ def test_download_asset_reports_protocol_error_without_reading_secret(tmp_path):
 
     assert caught.value.code == "AUTH_REQUIRED"
     assert "worker-token" not in str(caught.value)
+
+
+def test_download_asset_consumes_unread_stream_error_before_mapping(tmp_path):
+    transport = RecordingTransport(
+        [
+            httpx.Response(
+                401,
+                stream=OneChunkStream(
+                    b'{"code":"AUTH_REQUIRED","message":"sign in required"}'
+                ),
+            )
+        ]
+    )
+    client = make_client(transport)
+
+    with pytest.raises(ControlPlaneError) as caught:
+        run_async(client.download_asset("asset-1", tmp_path / "target.wav"))
+
+    assert caught.value.code == "AUTH_REQUIRED"
 
 
 def test_upload_result_sends_audio_and_metadata(tmp_path):

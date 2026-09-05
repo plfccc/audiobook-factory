@@ -18,6 +18,7 @@ from audiobook_worker.contracts import (
 from audiobook_worker.model_registry import ModelProfile
 from audiobook_worker.runtime_probe import RuntimeProbe
 from audiobook_worker.contracts import EngineCapabilities
+from audiobook_worker.server_client import ControlPlaneError
 
 
 def run_async(awaitable):
@@ -188,6 +189,194 @@ def test_prepare_voice_is_awaited_so_heartbeat_can_run(tmp_path):
         assert heartbeat_seen.is_set()
 
     run_async(exercise())
+
+
+def test_lease_lost_heartbeat_stops_synthesis_and_skips_upload(tmp_path):
+    client = FakeClient(make_job(tmp_path))
+    lease_lost = asyncio.Event()
+
+    class LeaseLostClient(FakeClient):
+        async def heartbeat(self, job_id, progress):
+            lease_lost.set()
+            raise ControlPlaneError("lease lost", code="LEASE_LOST")
+
+    class BlockingEngine(FakeEngine):
+        def __init__(self):
+            super().__init__()
+            self.synthesis_started = asyncio.Event()
+            self.synthesis_cancelled = asyncio.Event()
+
+        async def synthesize(self, job, destination):
+            self.synthesis_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.synthesis_cancelled.set()
+                raise
+
+    client = LeaseLostClient(client.job)
+    engine = BlockingEngine()
+    worker = ColabWorker(
+        client=client,
+        engine=engine,
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+        heartbeat_interval_seconds=0.001,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(worker.run_once())
+        await asyncio.wait_for(engine.synthesis_started.wait(), 0.2)
+        await asyncio.wait_for(lease_lost.wait(), 0.2)
+        return await asyncio.wait_for(task, 0.2)
+
+    assert run_async(exercise()) is False
+    assert worker.state is WorkerState.STOPPED
+    assert engine.synthesis_cancelled.is_set()
+    assert client.upload_calls == []
+
+
+def test_manual_auth_pause_does_not_reregister_or_reclaim(tmp_path):
+    class AuthPausedClient(FakeClient):
+        async def claim_job(self):
+            self.claim_calls += 1
+            raise ControlPlaneError("manual sign-in required", code="AUTH_REQUIRED")
+
+    client = AuthPausedClient(None)
+    worker = ColabWorker(
+        client=client,
+        engine=FakeEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert worker.state is WorkerState.AUTH_REQUIRED
+    assert len(client.register_calls) == 1
+    assert client.claim_calls == 1
+
+    assert run_async(worker.run_once()) is False
+    assert worker.state is WorkerState.AUTH_REQUIRED
+    assert len(client.register_calls) == 1
+    assert client.claim_calls == 1
+
+
+def test_job_model_must_match_startup_selected_model(tmp_path):
+    job = make_job(tmp_path)
+    incompatible_job = replace(
+        job,
+        preset=replace(
+            job.preset,
+            model="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        ),
+    )
+    client = FakeClient(incompatible_job)
+    engine = FakeEngine()
+    worker = ColabWorker(
+        client=client,
+        engine=engine,
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert engine.prepare_calls == []
+    assert engine.synthesize_calls == []
+    assert client.upload_calls == []
+    assert client.failure_calls[0][1] == "MODEL_NOT_COMPATIBLE"
+
+
+def test_generation_timeout_is_reported_and_not_uploaded(tmp_path):
+    class SlowEngine(FakeEngine):
+        async def synthesize(self, job, destination):
+            await asyncio.sleep(10)
+
+    client = FakeClient(make_job(tmp_path))
+    worker = ColabWorker(
+        client=client,
+        engine=SlowEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+        generation_timeout_seconds=0.01,
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert client.upload_calls == []
+    assert client.failure_calls[0][1] == "GENERATION_TIMEOUT"
+
+
+def test_download_timeout_is_reported_before_synthesis(tmp_path):
+    source_job = make_job(tmp_path)
+    remote_job = replace(
+        source_job,
+        voice_profile=replace(
+            source_job.voice_profile,
+            reference_audio_path=Path("asset-1"),
+        ),
+    )
+    digest = hashlib.sha256(b"downloaded reference").hexdigest()
+
+    class SlowDownloadClient(FakeClient):
+        def reference_asset(self, job_id):
+            return {"asset_id": "asset-1", "sha256": digest}
+
+        async def download_asset(self, asset_id, target):
+            await asyncio.sleep(10)
+            return Path(target)
+
+    client = SlowDownloadClient(remote_job)
+    worker = ColabWorker(
+        client=client,
+        engine=FakeEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+        download_timeout_seconds=0.01,
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert worker.engine.prepare_calls == []
+    assert client.failure_calls[0][1] == "DOWNLOAD_TIMEOUT"
+
+
+def test_missing_or_invalid_asset_sha_is_rejected_without_download(tmp_path):
+    source_job = make_job(tmp_path)
+    remote_job = replace(
+        source_job,
+        voice_profile=replace(
+            source_job.voice_profile,
+            reference_audio_path=Path("asset-1"),
+        ),
+    )
+
+    class InvalidShaClient(FakeClient):
+        def __init__(self, job):
+            super().__init__(job)
+            self.download_calls = []
+
+        def reference_asset(self, job_id):
+            return {"asset_id": "asset-1", "sha256": "not-a-sha256"}
+
+        async def download_asset(self, asset_id, target):
+            self.download_calls.append((asset_id, Path(target)))
+            raise AssertionError("invalid asset must be rejected before download")
+
+    client = InvalidShaClient(remote_job)
+    worker = ColabWorker(
+        client=client,
+        engine=FakeEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert client.download_calls == []
+    assert client.failure_calls[0][1] == "INVALID_ASSET_SHA256"
 
 
 def test_run_once_enters_waiting_for_gpu_without_registering_or_claiming(tmp_path):

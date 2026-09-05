@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import asdict, is_dataclass, replace
 from enum import StrEnum
 import hashlib
@@ -12,13 +13,13 @@ from typing import Any, Awaitable, Callable, Mapping
 import httpx
 
 from .config import WorkerSettings
-from .contracts import GenerationResult, TtsJob, VoiceProfile
+from .contracts import GenerationResult, TtsJob
 from .errors import WorkerError
 from .gpu_selector import GpuSelector
 from .model_registry import ModelProfile, ModelRegistry
 from .qwen_engine import Qwen3TtsEngine
 from .runtime_probe import RuntimeProbe
-from .server_client import ControlPlaneClient, ControlPlaneError
+from .server_client import ControlPlaneClient, ControlPlaneError, validate_job_id
 
 
 class WorkerState(StrEnum):
@@ -31,17 +32,45 @@ class WorkerState(StrEnum):
     WAITING_FOR_GPU = "WAITING_FOR_GPU"
     AUTH_REQUIRED = "AUTH_REQUIRED"
     QUOTA_PAUSED = "QUOTA_PAUSED"
+    HUMAN_REQUIRED = "HUMAN_REQUIRED"
     BACKOFF = "BACKOFF"
     FAILED = "FAILED"
     STOPPED = "STOPPED"
 
 
 _WAITING_CODES = frozenset(
-    {"AUTH_REQUIRED", "QUOTA_PAUSED", "WAITING_FOR_GPU"}
+    {"AUTH_REQUIRED", "QUOTA_PAUSED", "HUMAN_REQUIRED", "WAITING_FOR_GPU"}
+)
+_MANUAL_PAUSE_CODES = frozenset(
+    {"AUTH_REQUIRED", "QUOTA_PAUSED", "HUMAN_REQUIRED"}
+)
+_STOP_CODES = frozenset(
+    {
+        "LEASE_LOST",
+        "WORKER_STOPPED",
+        "WORKER_STOPPING",
+        "STOPPED",
+        "WORKER_DISABLED",
+        "REVOKED",
+    }
 )
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 EngineFactory = Callable[[ModelProfile, RuntimeProbe, Path], Any]
 Sleep = Callable[[float], Awaitable[None]]
+
+
+class _TaskFailure(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _OperationAborted(_TaskFailure):
+    pass
+
+
+class _OperationTimedOut(_TaskFailure):
+    pass
 
 
 class ColabWorker:
@@ -62,6 +91,8 @@ class ColabWorker:
         heartbeat_interval_seconds: float = 30.0,
         claim_wait_seconds: float = 15.0,
         network_backoff_seconds: tuple[float, ...] = (15.0, 30.0, 60.0),
+        generation_timeout_seconds: float = 180.0,
+        download_timeout_seconds: float = 60.0,
         sleep: Sleep | None = None,
     ) -> None:
         self.client = client
@@ -75,10 +106,17 @@ class ColabWorker:
         self.heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self.claim_wait_seconds = float(claim_wait_seconds)
         self.network_backoff_seconds = tuple(network_backoff_seconds) or (15.0,)
+        self.generation_timeout_seconds = _positive_timeout(
+            generation_timeout_seconds, "generation_timeout_seconds"
+        )
+        self.download_timeout_seconds = _positive_timeout(
+            download_timeout_seconds, "download_timeout_seconds"
+        )
         self._sleep = sleep or asyncio.sleep
         self.state = WorkerState.CREATED
         self.registration: Any | None = None
         self._started = False
+        self._halted = False
         self._last_error: Exception | None = None
 
     @classmethod
@@ -98,6 +136,7 @@ class ColabWorker:
             connect_timeout=settings.control_connect_timeout_seconds,
             read_timeout=settings.control_read_timeout_seconds,
             write_timeout=settings.control_write_timeout_seconds,
+            download_timeout=settings.download_timeout_seconds,
         )
         return cls(
             client,
@@ -110,16 +149,20 @@ class ColabWorker:
                 settings.network_backoff_base_seconds * 2,
                 settings.network_backoff_base_seconds * 4,
             ),
+            generation_timeout_seconds=settings.generation_timeout_seconds,
+            download_timeout_seconds=settings.download_timeout_seconds,
             **kwargs,
         )
 
     async def run_once(self) -> bool:
-        if not await self._ensure_started():
+        if self._halted:
             return False
         try:
+            if not await self._ensure_started():
+                return False
             job = await _call_async(self.client.claim_job)
         except ControlPlaneError as error:
-            if error.code in _WAITING_CODES:
+            if error.code in _STOP_CODES or error.code in _WAITING_CODES:
                 self._enter_protocol_wait(error)
                 return False
             raise
@@ -132,7 +175,7 @@ class ColabWorker:
         event = stop_event or asyncio.Event()
         network_failures = 0
         try:
-            while not event.is_set():
+            while not event.is_set() and not self._halted:
                 try:
                     processed = await self.run_once()
                     network_failures = 0
@@ -146,8 +189,10 @@ class ColabWorker:
                     await self._wait(event, delay)
                     continue
                 except ControlPlaneError as error:
-                    if error.code in _WAITING_CODES:
+                    if error.code in _STOP_CODES or error.code in _WAITING_CODES:
                         self._enter_protocol_wait(error)
+                        if self._halted:
+                            break
                         await self._wait(event, self.claim_wait_seconds)
                         continue
                     self._last_error = error
@@ -165,18 +210,23 @@ class ColabWorker:
                     self.state = WorkerState.FAILED
                     await self._wait(event, self.claim_wait_seconds)
                     continue
+                if self._halted:
+                    break
                 if event.is_set():
                     break
                 if processed:
                     continue
                 await self._wait(event, self.claim_wait_seconds)
         finally:
-            self.state = WorkerState.STOPPED
+            if not self._is_manual_pause_state():
+                self.state = WorkerState.STOPPED
             close = getattr(self.client, "aclose", None)
             if callable(close):
                 await _call_async(close)
 
     async def _ensure_started(self) -> bool:
+        if self._halted:
+            return False
         if self._started:
             return self.engine is not None
         self.runtime = self.runtime or RuntimeProbe.detect()
@@ -214,34 +264,68 @@ class ColabWorker:
     async def _process_job(self, job: TtsJob) -> bool:
         if not isinstance(job, TtsJob):
             raise TypeError("claim_job must return TtsJob or None")
+
+        try:
+            self._validate_job_for_worker(job)
+        except _TaskFailure as error:
+            self._last_error = error
+            self.state = WorkerState.FAILED
+            await self._report_failure(job.job_id, error.code, error)
+            return False
+
         self.state = WorkerState.LEASED
         heartbeat_stop = asyncio.Event()
+        operation_abort = asyncio.Event()
         heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(job.job_id, heartbeat_stop)
+            self._heartbeat_loop(job.job_id, heartbeat_stop, operation_abort)
         )
         try:
-            job = await self._materialize_job_reference(job)
+            job = await self._materialize_job_reference(job, operation_abort)
+            self._ensure_operation_allowed(operation_abort)
             self.state = WorkerState.GENERATING
-            await self._prepare_voice(job)
-            destination = self.cache_dir / "outputs" / f"{job.job_id}.wav"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            result = await _call_async(
-                self.engine.synthesize,
-                job,
-                destination,
+            await self._run_guarded(
+                lambda: self._prepare_voice(job),
+                operation_abort,
+                timeout_seconds=self.generation_timeout_seconds,
+                timeout_code="GENERATION_TIMEOUT",
             )
+            destination = self._output_path(job.job_id)
+            result = await self._run_guarded(
+                lambda: _call_async(
+                    self.engine.synthesize,
+                    job,
+                    destination,
+                ),
+                operation_abort,
+                timeout_seconds=self.generation_timeout_seconds,
+                timeout_code="GENERATION_TIMEOUT",
+            )
+            self._ensure_operation_allowed(operation_abort)
             metadata, output_path = _result_metadata(result, destination)
+            output_path = _validate_output_path(output_path, self._output_root())
             self.state = WorkerState.UPLOADING
-            await _call_async(
-                self.client.upload_result,
-                job.job_id,
-                output_path,
-                metadata,
+            await self._run_guarded(
+                lambda: _call_async(
+                    self.client.upload_result,
+                    job.job_id,
+                    output_path,
+                    metadata,
+                ),
+                operation_abort,
             )
+            self._ensure_operation_allowed(operation_abort)
             self.state = WorkerState.IDLE
             return True
         except asyncio.CancelledError:
             raise
+        except _OperationAborted:
+            return False
+        except _TaskFailure as error:
+            self._last_error = error
+            self.state = WorkerState.FAILED
+            if not self._halted:
+                await self._report_failure(job.job_id, error.code, error)
+            return False
         except httpx.RequestError as error:
             self._last_error = error
             self.state = WorkerState.BACKOFF
@@ -249,6 +333,9 @@ class ColabWorker:
         except ControlPlaneError as error:
             self._last_error = error
             if error.code in _WAITING_CODES:
+                self._enter_protocol_wait(error)
+                return False
+            if error.code in _STOP_CODES:
                 self._enter_protocol_wait(error)
                 return False
             if error.retryable:
@@ -277,14 +364,19 @@ class ColabWorker:
         if inspect.iscoroutinefunction(prepare):
             await prepare(job.voice_profile)
             return
-        # 第三方适配器若仍提供同步入口，也不能占用心跳事件循环。
+        # 同步适配器必须卸载到线程，不能阻塞心跳事件循环。
         result = await asyncio.to_thread(prepare, job.voice_profile)
         if inspect.isawaitable(result):
             await result
 
     async def _heartbeat_loop(
-        self, job_id: str, stop_event: asyncio.Event
+        self,
+        job_id: str,
+        stop_event: asyncio.Event,
+        operation_abort: asyncio.Event | None = None,
     ) -> None:
+        operation_abort = operation_abort or asyncio.Event()
+        await asyncio.sleep(min(0.01, max(0.001, self.heartbeat_interval_seconds)))
         while not stop_event.is_set():
             try:
                 await _call_async(
@@ -296,13 +388,29 @@ class ColabWorker:
                 raise
             except ControlPlaneError as error:
                 self._last_error = error
+                if error.code in _STOP_CODES:
+                    self._enter_protocol_wait(error)
+                    operation_abort.set()
+                    return
                 if error.code in _WAITING_CODES:
                     self._enter_protocol_wait(error)
+                    operation_abort.set()
+                    return
             except (httpx.RequestError, TimeoutError) as error:
                 self._last_error = error
-            await self._wait(stop_event, self.heartbeat_interval_seconds)
+            if operation_abort.is_set():
+                return
+            await self._wait(
+                stop_event,
+                self.heartbeat_interval_seconds,
+                sleep=asyncio.sleep,
+            )
 
-    async def _materialize_job_reference(self, job: TtsJob) -> TtsJob:
+    async def _materialize_job_reference(
+        self,
+        job: TtsJob,
+        operation_abort: asyncio.Event | None = None,
+    ) -> TtsJob:
         profile = job.voice_profile
         if profile is None or profile.reference_audio_path is None:
             return job
@@ -313,6 +421,13 @@ class ColabWorker:
         get_asset = getattr(self.client, "reference_asset", None)
         if callable(get_asset):
             asset_info = get_asset(job.job_id)
+            if inspect.isawaitable(asset_info):
+                asset_info = await asset_info
+        if not isinstance(asset_info, Mapping):
+            raise _TaskFailure(
+                "INVALID_ASSET_SHA256",
+                "remote reference asset metadata is missing",
+            )
         asset_id = (
             str(asset_info.get("asset_id"))
             if isinstance(asset_info, Mapping) and asset_info.get("asset_id")
@@ -323,23 +438,71 @@ class ColabWorker:
             if isinstance(asset_info, Mapping) and asset_info.get("sha256")
             else None
         )
-        digest = (
-            supplied_digest.lower()
-            if supplied_digest and _SHA256.fullmatch(supplied_digest)
-            else hashlib.sha256(asset_id.encode("utf-8")).hexdigest()
-        )
-        target = self.cache_dir / "voices" / f"{digest}.wav"
-        if not target.exists():
-            downloaded = await _call_async(
-                self.client.download_asset,
-                asset_id,
-                target,
+        if (
+            not isinstance(supplied_digest, str)
+            or not _SHA256.fullmatch(supplied_digest)
+        ):
+            raise _TaskFailure(
+                "INVALID_ASSET_SHA256",
+                "remote reference asset must include a valid SHA256",
             )
-            target = Path(downloaded)
-        if supplied_digest and _SHA256.fullmatch(supplied_digest):
-            actual = _sha256_file(target)
-            if actual != supplied_digest.lower():
-                raise ValueError("downloaded reference audio SHA256 mismatch")
+        if not asset_id.strip():
+            raise _TaskFailure(
+                "INVALID_ASSET_SHA256",
+                "remote reference asset id must not be blank",
+            )
+        digest = supplied_digest.lower()
+        voice_root = self.cache_dir.resolve() / "voices"
+        voice_root.mkdir(parents=True, exist_ok=True)
+        target = voice_root / f"{digest}.wav"
+        _assert_path_inside(target, voice_root, "reference cache path")
+        if target.exists():
+            if not target.is_file():
+                raise _TaskFailure(
+                    "INVALID_ASSET_SHA256",
+                    "reference cache entry is not a file",
+                )
+            if _sha256_file(target) != digest:
+                target.unlink(missing_ok=True)
+        if not target.exists():
+            download = getattr(self.client, "download_asset", None)
+            if not callable(download):
+                raise _TaskFailure(
+                    "INVALID_ASSET_SHA256",
+                    "client cannot download the remote reference asset",
+                )
+            abort = operation_abort or asyncio.Event()
+            try:
+                downloaded = await self._run_guarded(
+                    lambda: _call_async(download, asset_id, target),
+                    abort,
+                    timeout_seconds=self.download_timeout_seconds,
+                    timeout_code="DOWNLOAD_TIMEOUT",
+                )
+            except _OperationTimedOut:
+                raise
+            except (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException) as error:
+                raise _OperationTimedOut(
+                    "DOWNLOAD_TIMEOUT",
+                    "reference audio download timed out",
+                ) from error
+            try:
+                downloaded_path = Path(downloaded)
+            except (TypeError, ValueError) as error:
+                raise _TaskFailure(
+                    "INVALID_ASSET_SHA256",
+                    "client returned an invalid reference path",
+                ) from error
+            if downloaded_path.resolve() != target.resolve():
+                raise _TaskFailure(
+                    "INVALID_ASSET_SHA256",
+                    "downloaded reference path does not match its cache key",
+                )
+        if not target.is_file() or _sha256_file(target) != digest:
+            raise _TaskFailure(
+                "INVALID_ASSET_SHA256",
+                "downloaded reference audio SHA256 mismatch",
+            )
         return replace(
             job,
             voice_profile=replace(profile, reference_audio_path=target),
@@ -351,23 +514,143 @@ class ColabWorker:
             return
         try:
             await _call_async(report, job_id, code, str(error))
+        except ControlPlaneError as report_error:
+            self._last_error = report_error
+            if report_error.code in _WAITING_CODES or report_error.code in _STOP_CODES:
+                self._enter_protocol_wait(report_error)
         except Exception as report_error:
             self._last_error = report_error
 
     def _enter_protocol_wait(self, error: ControlPlaneError) -> None:
         self._last_error = error
+        code = str(error.code)
+        if code in _STOP_CODES:
+            self._halted = True
+            self.state = WorkerState.STOPPED
+            return
         try:
-            self.state = WorkerState(str(error.code))
+            self.state = WorkerState(code)
         except ValueError:
             self.state = WorkerState.BACKOFF
-        if error.code in _WAITING_CODES:
+        if code in _MANUAL_PAUSE_CODES:
+            self._halted = True
+            return
+        if code == "WAITING_FOR_GPU":
             self._started = False
             self.registration = None
 
-    async def _wait(self, stop_event: asyncio.Event, seconds: float) -> None:
+    def _validate_job_for_worker(self, job: TtsJob) -> None:
+        try:
+            validate_job_id(job.job_id)
+        except ValueError as error:
+            raise _TaskFailure(
+                "INVALID_JOB_ID", "job_id is not a safe path component"
+            ) from error
+        if self.selected_model is None:
+            raise _TaskFailure(
+                "MODEL_NOT_COMPATIBLE",
+                "worker has no compatible model selected",
+            )
+        if job.preset.model != self.selected_model.model_id:
+            raise _TaskFailure(
+                "MODEL_NOT_COMPATIBLE",
+                "job preset model does not match the selected GPU model",
+            )
+
+    def _output_root(self) -> Path:
+        root = self.cache_dir.resolve() / "outputs"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _output_path(self, job_id: str) -> Path:
+        validate_job_id(job_id)
+        root = self._output_root()
+        destination = root / f"{job_id}.wav"
+        _assert_path_inside(destination, root, "output path")
+        return destination
+
+    def _ensure_operation_allowed(self, operation_abort: asyncio.Event) -> None:
+        if operation_abort.is_set():
+            raise _OperationAborted(
+                self._abort_code(),
+                "worker operation was stopped by the control protocol",
+            )
+
+    def _abort_code(self) -> str:
+        if isinstance(self._last_error, ControlPlaneError):
+            return str(self._last_error.code)
+        return "WORKER_STOPPED" if self._halted else "WORKER_STOPPING"
+
+    def _is_manual_pause_state(self) -> bool:
+        return self._halted and self.state in {
+            WorkerState.AUTH_REQUIRED,
+            WorkerState.QUOTA_PAUSED,
+            WorkerState.HUMAN_REQUIRED,
+        }
+
+    async def _run_guarded(
+        self,
+        operation_factory: Callable[[], Awaitable[Any]],
+        operation_abort: asyncio.Event,
+        *,
+        timeout_seconds: float | None = None,
+        timeout_code: str = "GENERATION_TIMEOUT",
+    ) -> Any:
+        operation_task = asyncio.create_task(operation_factory())
+        abort_task = asyncio.create_task(operation_abort.wait())
+        timer_task = (
+            asyncio.create_task(asyncio.sleep(timeout_seconds))
+            if timeout_seconds is not None
+            else None
+        )
+        watched = {operation_task, abort_task}
+        if timer_task is not None:
+            watched.add(timer_task)
+        try:
+            done, _ = await asyncio.wait(
+                watched,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if abort_task in done and operation_abort.is_set():
+                await _cancel_task(operation_task)
+                raise _OperationAborted(
+                    self._abort_code(),
+                    "worker operation was stopped by the control protocol",
+                )
+            if operation_task in done:
+                return await operation_task
+            if timer_task is not None and timer_task in done:
+                await _cancel_task(operation_task)
+                raise _OperationTimedOut(
+                    timeout_code,
+                    f"worker operation exceeded {timeout_code.lower()}",
+                )
+            return await operation_task
+        except asyncio.CancelledError:
+            await _cancel_task(operation_task)
+            raise
+        finally:
+            for task in (abort_task, timer_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending = [
+                task
+                for task in (abort_task, timer_task)
+                if task is not None and not task.done()
+            ]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _wait(
+        self,
+        stop_event: asyncio.Event,
+        seconds: float,
+        *,
+        sleep: Sleep | None = None,
+    ) -> None:
         if seconds <= 0 or stop_event.is_set():
             return
-        sleep_task = asyncio.create_task(self._sleep(seconds))
+        sleep_task = asyncio.create_task((sleep or self._sleep)(seconds))
         stop_task = asyncio.create_task(stop_event.wait())
         done, pending = await asyncio.wait(
             {sleep_task, stop_task},
@@ -375,6 +658,8 @@ class ColabWorker:
         )
         for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
             if task is not stop_task:
                 await task
@@ -432,6 +717,8 @@ def _result_metadata(result: Any, destination: Path) -> tuple[dict[str, Any], Pa
 
 
 def _failure_code(error: Exception) -> str:
+    if isinstance(error, _TaskFailure):
+        return error.code
     if isinstance(error, WorkerError):
         return error.code.value
     if isinstance(error, ControlPlaneError):
@@ -456,6 +743,43 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _positive_timeout(value: float, name: str) -> float:
+    result = float(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive")
+    return result
+
+
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+def _assert_path_inside(path: Path, root: Path, label: str) -> None:
+    candidate = path.resolve()
+    root_path = root.resolve()
+    try:
+        candidate.relative_to(root_path)
+    except ValueError as error:
+        raise _TaskFailure(
+            "OUTPUT_PATH_INVALID" if label == "output path" else "INVALID_ASSET_SHA256",
+            f"{label} must stay inside the worker directory",
+        ) from error
+
+
+def _validate_output_path(path: Path, root: Path) -> Path:
+    output_path = Path(path)
+    _assert_path_inside(output_path, root, "output path")
+    if not output_path.is_file():
+        raise _TaskFailure(
+            "OUTPUT_PATH_INVALID",
+            "TTS engine did not return a readable output path",
+        )
+    return output_path
 
 
 __all__ = ["ColabWorker", "WorkerState"]

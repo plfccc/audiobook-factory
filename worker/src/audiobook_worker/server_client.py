@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
+from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .contracts import EngineCapabilities, TtsJob, TtsPreset, VoiceProfile
+from .contracts import TtsJob, TtsPreset, VoiceProfile
 from .runtime_probe import RuntimeProbe
 
 
 _BASE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 _HEX_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_LOCAL_CONTROL_HOSTS = frozenset(
+    {"localhost", "127.0.0.1", "::1", "control-center", "testserver"}
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class ControlPlaneClient:
         read_timeout: float = 60.0,
         write_timeout: float = 120.0,
         pool_timeout: float = 10.0,
+        download_timeout: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -68,7 +73,7 @@ class ControlPlaneClient:
             raise ValueError("base_url must not be blank")
         if not isinstance(token, str) or not token.strip():
             raise ValueError("token must not be blank")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _validate_base_url(base_url, token)
         self._token = token
         self._transport = transport
         self._client = http_client
@@ -79,6 +84,9 @@ class ControlPlaneClient:
             write=write_timeout,
             pool=pool_timeout,
         )
+        if download_timeout is not None and download_timeout <= 0:
+            raise ValueError("download_timeout must be positive")
+        self._download_timeout = download_timeout
         self._reference_assets: dict[str, dict[str, str | None]] = {}
 
     def __repr__(self) -> str:
@@ -149,7 +157,7 @@ class ControlPlaneClient:
     async def heartbeat(self, job_id: str, progress: Any) -> None:
         await self._request(
             "POST",
-            f"/api/v1/workers/jobs/{_path_segment(job_id)}/heartbeat",
+            f"/api/v1/workers/jobs/{_job_path_segment(job_id)}/heartbeat",
             json=_json_compatible(progress),
             allow_statuses={204},
         )
@@ -165,10 +173,15 @@ class ControlPlaneClient:
         temporary.unlink(missing_ok=True)
         try:
             client = self._ensure_client()
+            stream_kwargs: dict[str, Any] = {
+                "headers": self._headers(),
+            }
+            if self._download_timeout is not None:
+                stream_kwargs["timeout"] = self._download_timeout
             async with client.stream(
                 "GET",
                 self._url(f"/api/v1/assets/{_path_segment(asset_id)}/download"),
-                headers=self._headers(),
+                **stream_kwargs,
             ) as response:
                 await self._raise_for_response(response)
                 with temporary.open("wb") as output:
@@ -191,7 +204,7 @@ class ControlPlaneClient:
         with audio.open("rb") as source:
             response = await self._request(
                 "POST",
-                f"/api/v1/workers/jobs/{_path_segment(job_id)}/result",
+                f"/api/v1/workers/jobs/{_job_path_segment(job_id)}/result",
                 files={"audio": (audio.name, source, "audio/wav")},
                 data={
                     "metadata": json.dumps(
@@ -207,7 +220,7 @@ class ControlPlaneClient:
     async def report_failure(self, job_id: str, code: str, message: str) -> None:
         await self._request(
             "POST",
-            f"/api/v1/workers/jobs/{_path_segment(job_id)}/failure",
+            f"/api/v1/workers/jobs/{_job_path_segment(job_id)}/failure",
             json={"code": str(code), "message": str(message)},
             allow_statuses={204},
         )
@@ -247,6 +260,10 @@ class ControlPlaneClient:
         allowed = allow_statuses or set()
         if 200 <= response.status_code < 300 or response.status_code in allowed:
             return
+        try:
+            await response.aread()
+        except (httpx.HTTPError, OSError, RuntimeError):
+            pass
         data = _json_body(response)
         code = _value(data, "code", "errorCode", "error_code")
         if not code:
@@ -300,6 +317,13 @@ def _job_from_payload(payload: Mapping[str, Any]) -> TtsJob:
         raise ControlPlaneError(
             "claim response omitted jobId", code="INVALID_RESPONSE"
         )
+    try:
+        validate_job_id(job_id)
+    except ValueError as error:
+        raise ControlPlaneError(
+            "claim response contains an invalid job_id",
+            code="INVALID_RESPONSE",
+        ) from error
     profile_payload = _value(payload, "voiceProfile", "voice_profile")
     if not isinstance(profile_payload, Mapping):
         profile_payload = None
@@ -433,7 +457,11 @@ def _reference_asset_from_payload(
 
 
 def _json_body(response: httpx.Response) -> dict[str, Any]:
-    if not response.content:
+    try:
+        content = response.content
+    except httpx.ResponseNotRead:
+        return {}
+    if not content:
         return {}
     try:
         data = response.json()
@@ -454,9 +482,50 @@ def _string_or_none(value: Any) -> str | None:
 
 
 def _path_segment(value: str) -> str:
-    from urllib.parse import quote
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("path component must not be blank")
+    return quote(value, safe="")
 
-    return quote(str(value), safe="")
+
+def _job_path_segment(job_id: str) -> str:
+    return quote(validate_job_id(job_id), safe="")
+
+
+def validate_job_id(job_id: str) -> str:
+    """Validate the identifier before it is used in a URL or local path."""
+
+    if not isinstance(job_id, str) or not _SAFE_PATH_COMPONENT.fullmatch(job_id):
+        raise ValueError("job_id must be a safe ASCII path component")
+    if job_id in {".", ".."}:
+        raise ValueError("job_id must be a safe ASCII path component")
+    return job_id
+
+
+def _validate_base_url(base_url: str, token: str) -> str:
+    candidate = base_url.strip()
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError as error:
+        raise ValueError("base_url must be a valid URL") from error
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must include an HTTP(S) host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base_url must not contain credentials in the URL")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base_url must not contain query or fragment data in the URL")
+    if any(character in candidate for character in ("\r", "\n")):
+        raise ValueError("base_url must not contain control characters")
+    try:
+        hostname = parsed.hostname
+    except ValueError as error:
+        raise ValueError("base_url must contain a valid host") from error
+    if not hostname:
+        raise ValueError("base_url must contain a host")
+    if parsed.scheme.lower() == "http" and hostname.lower() not in _LOCAL_CONTROL_HOSTS:
+        raise ValueError("HTTPS is required for non-local control-plane URLs")
+    if token and token in candidate:
+        raise ValueError("base_url must not contain the worker token in the URL")
+    return candidate.rstrip("/")
 
 
 def _json_compatible(value: Any) -> Any:
@@ -479,4 +548,9 @@ def _redact(message: str, secret: str) -> str:
     return message.replace(secret, "[REDACTED]") if secret else message
 
 
-__all__ = ["ControlPlaneClient", "ControlPlaneError", "WorkerRegistration"]
+__all__ = [
+    "ControlPlaneClient",
+    "ControlPlaneError",
+    "WorkerRegistration",
+    "validate_job_id",
+]

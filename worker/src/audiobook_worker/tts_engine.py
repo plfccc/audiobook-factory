@@ -17,8 +17,8 @@ class TtsEngine(Protocol):
     capabilities: EngineCapabilities
     probe: RuntimeProbe
 
-    def prepare_voice(self, profile: VoiceProfile) -> PreparedVoice:
+    async def prepare_voice(self, profile: VoiceProfile) -> PreparedVoice:
         ...
 
-    def synthesize(self, job: TtsJob, destination: Path) -> GenerationResult:
+    async def synthesize(self, job: TtsJob, destination: Path) -> GenerationResult:
         ...

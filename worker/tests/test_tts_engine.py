@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import inspect
 from pathlib import Path
 
 import pytest
@@ -97,6 +98,8 @@ def test_tts_engine_protocol_exposes_shared_operations():
     assert "probe" in TtsEngine.__annotations__
     assert callable(TtsEngine.prepare_voice)
     assert callable(TtsEngine.synthesize)
+    assert inspect.iscoroutinefunction(TtsEngine.prepare_voice)
+    assert inspect.iscoroutinefunction(TtsEngine.synthesize)
 
 
 def test_tts_contracts_are_immutable():

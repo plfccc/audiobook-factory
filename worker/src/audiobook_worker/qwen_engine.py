@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -112,19 +113,20 @@ class QwenModelAdapter:
             for key, value in qwen_parameters.items()
             if key in _QWEN_PARAMETER_NAMES
         }
+        output = Path(output_path)
+        was_existing = output.exists()
         generated = model.generate_voice_clone(
             text=text,
             language=language,
             voice_clone_prompt=prompt,
             **qwen_parameters,
         )
-        output = Path(output_path)
         if generated is not None:
             waveforms, sample_rate = generated
             waveform = _first_waveform(waveforms)
             waveform = _change_speed(waveform, speed)
             _write_wav(output, waveform, sample_rate)
-        elif not output.exists():
+        elif was_existing or not output.exists():
             raise RuntimeError("Qwen generate_voice_clone did not produce WAV output")
         return output
 
@@ -206,16 +208,35 @@ class Qwen3TtsEngine:
         self._lock = threading.RLock()
         self.probe = RuntimeProbe.detect()
 
-    def prepare_voice(self, profile: VoiceProfile) -> PreparedVoice:
-        return self._prepare_voice(profile, self.model_id)
+    async def prepare_voice(
+        self,
+        profile: VoiceProfile,
+        *,
+        language: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        model_id: str | None = None,
+    ) -> PreparedVoice:
+        return await asyncio.to_thread(
+            self._prepare_voice_blocking,
+            profile,
+            model_id or self.model_id,
+            language or "zh-CN",
+            dict(parameters or {}),
+        )
 
-    def _prepare_voice(
-        self, profile: VoiceProfile, model_id: str
+    def _prepare_voice_blocking(
+        self,
+        profile: VoiceProfile,
+        model_id: str,
+        language: str,
+        parameters: Mapping[str, Any],
     ) -> PreparedVoice:
         if not isinstance(profile, VoiceProfile):
             raise TypeError("profile must be a VoiceProfile")
 
-        reference_audio, reference_text = self._materialize_reference(profile)
+        reference_audio, reference_text = self._materialize_reference(
+            profile, language, parameters
+        )
         reference_digest = sha256_file(reference_audio)
         cache_key = hashlib.sha256(
             f"{model_id}\0{reference_digest}\0{reference_text}".encode("utf-8")
@@ -245,46 +266,81 @@ class Qwen3TtsEngine:
     ) -> GenerationResult:
         if not isinstance(job, TtsJob):
             raise TypeError("job must be a TtsJob")
+        if job.voice_profile is None:
+            raise ValueError(
+                "Qwen3TtsEngine requires voice_profile for voice cloning"
+            )
         output = Path(destination)
         output.parent.mkdir(parents=True, exist_ok=True)
-        prepared_model = await asyncio.to_thread(self._prepare_for_job, job)
-        await asyncio.to_thread(
+        parameters = _parameters_from_json(job.preset.parameters_json)
+        prepared_model = await asyncio.to_thread(
+            self._prepare_for_job, job, parameters
+        )
+        return await asyncio.to_thread(
             self._synthesize_blocking,
             job,
             prepared_model,
             output,
+            parameters,
         )
-        return await asyncio.to_thread(_generation_result, job.job_id, output)
 
-    def _prepare_for_job(self, job: TtsJob) -> _PreparedModel:
-        prepared = (
-            self._prepare_voice(job.voice_profile, job.preset.model)
-            if job.voice_profile is not None
-            else None
+    def _prepare_for_job(
+        self, job: TtsJob, parameters: Mapping[str, Any]
+    ) -> _PreparedModel:
+        prepared = self._prepare_voice_blocking(
+            job.voice_profile,
+            job.preset.model,
+            job.preset.language,
+            parameters,
         )
         return _PreparedModel(self._load_model(job.preset.model), prepared)
 
     def _synthesize_blocking(
-        self, job: TtsJob, prepared_model: _PreparedModel, destination: Path
-    ) -> None:
+        self,
+        job: TtsJob,
+        prepared_model: _PreparedModel,
+        destination: Path,
+        parameters: Mapping[str, Any],
+    ) -> GenerationResult:
         if job.preset.output_format.lower() != "wav":
             raise ValueError("Qwen3TtsEngine only supports WAV output")
-        parameters = _parameters_from_json(job.preset.parameters_json)
         text = normalize_text(job.text)
         language = normalize_language(job.preset.language)
         adapter = self._adapter_for(prepared_model.model)
-        adapter.generate_voice_clone(
-            prepared_model.model,
-            prepared_model.prepared.clone_prompt if prepared_model.prepared else None,
-            text,
-            language,
-            destination,
-            parameters,
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.stem}.",
+            suffix=".wav",
+            dir=str(destination.parent),
         )
-        if not destination.exists() or destination.stat().st_size == 0:
-            raise RuntimeError("Qwen3TtsEngine did not produce WAV output")
+        os.close(file_descriptor)
+        temporary_output = Path(temporary_name)
+        temporary_output.unlink(missing_ok=True)
+        try:
+            adapter.generate_voice_clone(
+                prepared_model.model,
+                prepared_model.prepared.clone_prompt,
+                text,
+                language,
+                temporary_output,
+                parameters,
+            )
+            if (
+                not temporary_output.exists()
+                or temporary_output.stat().st_size == 0
+            ):
+                raise RuntimeError("Qwen3TtsEngine did not produce WAV output")
+            generated = _generation_result(job.job_id, temporary_output)
+            os.replace(temporary_output, destination)
+            return replace(generated, output_path=destination)
+        finally:
+            temporary_output.unlink(missing_ok=True)
 
-    def _materialize_reference(self, profile: VoiceProfile) -> tuple[Path, str]:
+    def _materialize_reference(
+        self,
+        profile: VoiceProfile,
+        language: str,
+        parameters: Mapping[str, Any],
+    ) -> tuple[Path, str]:
         reference_text = profile.reference_text
         if not isinstance(reference_text, str) or not reference_text.strip():
             raise ValueError("reference_text is required for Qwen voice cloning")
@@ -300,8 +356,21 @@ class Qwen3TtsEngine:
             raise ValueError(
                 "voice profile requires reference_audio_path or design_prompt"
             )
+        design_language = normalize_language(language)
+        design_cache_payload = json.dumps(
+            {
+                "model_id": self.design_model_id,
+                "language": design_language,
+                "parameters": dict(parameters),
+                "design_prompt": profile.design_prompt.strip(),
+                "reference_text": reference_text,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         design_key = hashlib.sha256(
-            f"{profile.design_prompt}\0{reference_text}".encode("utf-8")
+            design_cache_payload.encode("utf-8")
         ).hexdigest()
         design_path = self.cache_dir / "voice-design" / f"{design_key}.wav"
         if not design_path.exists() or design_path.stat().st_size == 0:
@@ -311,10 +380,10 @@ class Qwen3TtsEngine:
             adapter.generate_voice_design(
                 design_model,
                 reference_text,
-                normalize_language("zh-CN"),
+                design_language,
                 profile.design_prompt.strip(),
                 design_path,
-                {},
+                parameters,
             )
         return (
             self._voice_store.materialize_path(

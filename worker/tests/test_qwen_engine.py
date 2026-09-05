@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 from pathlib import Path
+import pytest
 import sys
 import threading
 import wave
@@ -78,6 +79,20 @@ class _FakeQwen:
         return self.models.setdefault(model_id, _FakeModel(self, model_id))
 
 
+class _NoOutputModel(_FakeModel):
+    def generate_voice_clone(
+        self, *, text, language, voice_clone_prompt, **parameters
+    ):
+        self.owner.generate_calls += 1
+        return None
+
+
+class _NoOutputQwen(_FakeQwen):
+    def load(self, model_id, device):
+        self.load_calls.append((model_id, device))
+        return self.models.setdefault(model_id, _NoOutputModel(self, model_id))
+
+
 class _RecordingAdapter:
     def __init__(self):
         self.clone_prompt_calls = 0
@@ -110,15 +125,25 @@ def _write_test_wav(path, *, frames=240, sample_rate=24_000):
         wav.writeframes(b"\x00\x00" * frames)
 
 
-def make_tts_job(*, text, voice_profile):
+def make_tts_job(
+    *,
+    text,
+    voice_profile,
+    language="zh-CN",
+    parameters_json="{}",
+):
+    voice = voice_profile.profile_id if voice_profile is not None else "voice-1"
     preset = TtsPreset(
         "qwen3-tts",
         "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        voice_profile.profile_id,
+        voice,
         "自然朗读。",
-        "zh-CN",
+        language,
         "wav",
-        voice_profile_id=voice_profile.profile_id,
+        voice_profile_id=(
+            voice_profile.profile_id if voice_profile is not None else None
+        ),
+        parameters_json=parameters_json,
     )
     return TtsJob(
         "job-1",
@@ -179,6 +204,32 @@ def test_qwen_engine_reuses_cached_prompt_for_same_reference(tmp_path):
     assert fake_qwen.generate_calls == 2
     assert (tmp_path / "one.wav").exists()
     assert (tmp_path / "two.wav").exists()
+
+
+def test_prepare_voice_is_awaitable_and_offloads_model_work(tmp_path):
+    Qwen3TtsEngine, _, _ = _qwen_engine_types()
+    main_thread = threading.get_ident()
+    observed_threads = []
+
+    class ThreadRecordingQwen(_FakeQwen):
+        def load(self, model_id, device):
+            observed_threads.append(threading.get_ident())
+            return super().load(model_id, device)
+
+    fake_qwen = ThreadRecordingQwen()
+    engine = Qwen3TtsEngine(model_loader=fake_qwen.loader, cache_dir=tmp_path)
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"reference audio")
+    profile = VoiceProfile("voice-1", "旁白", reference_audio, "参考文本")
+
+    async def exercise():
+        prepared = await engine.prepare_voice(profile)
+        assert prepared.profile_id == profile.profile_id
+
+    run_async(exercise())
+
+    assert observed_threads
+    assert all(thread_id != main_thread for thread_id in observed_threads)
 
 
 def test_qwen_engine_forwards_parameters_and_normalizes_text(tmp_path):
@@ -289,6 +340,80 @@ def test_qwen_engine_materializes_voice_design_before_clone(tmp_path):
     ]
     assert fake_qwen.last_design["language"] == "Chinese"
     assert fake_qwen.last_design["instruct"] == profile.design_prompt
+
+
+def test_voice_design_uses_job_language_and_generation_parameters(tmp_path):
+    Qwen3TtsEngine, _, _ = _qwen_engine_types()
+    fake_qwen = _FakeQwen()
+    engine = Qwen3TtsEngine(model_loader=fake_qwen.loader, cache_dir=tmp_path)
+    profile = VoiceProfile(
+        "voice-1",
+        "旁白",
+        None,
+        "The night is quiet.",
+        "A calm, mature English narrator.",
+    )
+    parameters = {
+        "temperature": 0.42,
+        "top_k": 11,
+        "top_p": 0.7,
+        "repetition_penalty": 1.02,
+        "max_new_tokens": 128,
+    }
+    job = make_tts_job(
+        text="This is a designed voice.",
+        voice_profile=profile,
+        language="en-US",
+        parameters_json=json.dumps(parameters),
+    )
+
+    run_async(engine.synthesize(job, tmp_path / "design-parameters.wav"))
+
+    assert fake_qwen.last_design["language"] == "English"
+    for key, value in parameters.items():
+        assert fake_qwen.last_design["parameters"][key] == value
+
+
+def test_qwen_engine_does_not_accept_stale_destination_when_generation_returns_none(
+    tmp_path,
+):
+    Qwen3TtsEngine, _, _ = _qwen_engine_types()
+    fake_qwen = _NoOutputQwen()
+    engine = Qwen3TtsEngine(model_loader=fake_qwen.loader, cache_dir=tmp_path)
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"reference audio")
+    profile = VoiceProfile("voice-1", "旁白", reference_audio, "参考文本")
+    destination = tmp_path / "out.wav"
+    _write_test_wav(destination, frames=480)
+    stale_bytes = destination.read_bytes()
+
+    with pytest.raises(RuntimeError, match="output"):
+        run_async(
+            engine.synthesize(
+                make_tts_job(text="本轮没有输出。", voice_profile=profile),
+                destination,
+            )
+        )
+
+    assert destination.read_bytes() == stale_bytes
+
+
+def test_qwen_engine_rejects_jobs_without_voice_profile(tmp_path):
+    Qwen3TtsEngine, _, _ = _qwen_engine_types()
+    fake_qwen = _FakeQwen()
+    engine = Qwen3TtsEngine(model_loader=fake_qwen.loader, cache_dir=tmp_path)
+    destination = tmp_path / "without-profile.wav"
+
+    with pytest.raises(ValueError, match="voice_profile"):
+        run_async(
+            engine.synthesize(
+                make_tts_job(text="没有音色配置。", voice_profile=None),
+                destination,
+            )
+        )
+
+    assert fake_qwen.generate_calls == 0
+    assert not destination.exists()
 
 
 def test_qwen_engine_loads_the_model_selected_by_the_job_preset(tmp_path):

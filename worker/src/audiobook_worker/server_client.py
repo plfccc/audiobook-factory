@@ -273,6 +273,8 @@ class ControlPlaneClient:
                 429: "QUOTA_PAUSED",
                 503: "WAITING_FOR_GPU",
             }.get(response.status_code, "HTTP_ERROR")
+        if str(code).upper() == "WORKER_UNAUTHORIZED":
+            code = "AUTH_REQUIRED"
         message = _value(data, "message", "error", "detail")
         if not message:
             message = f"control-plane request failed with HTTP {response.status_code}"

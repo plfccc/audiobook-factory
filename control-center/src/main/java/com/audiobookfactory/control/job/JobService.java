@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -51,6 +52,9 @@ public class JobService {
     private static final long MAX_RESULT_BYTES = 512L * 1024 * 1024;
     private static final Set<String> RETRYABLE_FAILURE_CODES = Set.of(
             "GENERATION_TIMEOUT", "DOWNLOAD_TIMEOUT", "PAGE_NOT_READY", "TEMPORARY_FAILURE");
+    private static final Set<String> CONTROL_PLANE_FAILURE_CODES = Set.of(
+            "AUTH_REQUIRED", "QUOTA_PAUSED", "HUMAN_REQUIRED", "WAITING_FOR_GPU",
+            "WORKER_UNAUTHORIZED");
     private static final Set<String> SENSITIVE_PRESET_KEYS = Set.of(
             "cloneprompt", "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
     private static final Set<String> LEASED_STATUSES = Set.of("LEASED", "GENERATING", "UPLOADING");
@@ -92,7 +96,8 @@ public class JobService {
             resultSet.getInt("segment_index"),
             resultSet.getString("error_code"),
             resultSet.getString("error_message"),
-            resultSet.getString("result_idempotency_key"));
+            resultSet.getString("result_idempotency_key"),
+            resultSet.getString("book_status"));
 
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
@@ -253,15 +258,22 @@ public class JobService {
                     throw new ApiException("BOOK_NOT_FOUND", 404, "Book was not found");
                 }
                 if (idempotentTarget && targetStatus.equals(book.get().status())) {
+                    if ("PAUSED".equals(targetStatus)) {
+                        invalidateBookLeases(bookId);
+                    }
                     return 0;
                 }
                 if (!acceptedStatuses.contains(book.get().status())) {
                     throw new ApiException("BOOK_STATE_CONFLICT", 409,
                             "Book cannot transition from its current state");
                 }
-                return jdbcTemplate.update(
+                int statusUpdated = jdbcTemplate.update(
                         "UPDATE book SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                         targetStatus, bookId);
+                if ("PAUSED".equals(targetStatus)) {
+                    invalidateBookLeases(bookId);
+                }
+                return statusUpdated;
             });
             if (updated == null) {
                 throw new IllegalStateException("book status transaction returned no result");
@@ -270,6 +282,29 @@ public class JobService {
             throw new ApiException("ANOTHER_BOOK_RUNNING", 409,
                     "Only one book may be running at a time");
         }
+    }
+
+    private void invalidateBookLeases(long bookId) {
+        jdbcTemplate.update("""
+                UPDATE generation_job gj
+                SET status = CASE
+                        WHEN gj.status IN ('LEASED', 'GENERATING', 'UPLOADING') THEN 'WAITING'
+                        ELSE gj.status
+                    END,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    heartbeat_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM chapter c
+                    JOIN book_version bv ON bv.id = c.book_version_id
+                    WHERE c.id = gj.chapter_id AND bv.book_id = ?
+                )
+                  AND (gj.status IN ('LEASED', 'GENERATING', 'UPLOADING')
+                       OR gj.lease_owner IS NOT NULL
+                       OR gj.lease_expires_at IS NOT NULL)
+                """, bookId);
     }
 
     public void heartbeat(long jobId, String workerId) {
@@ -304,42 +339,57 @@ public class JobService {
         transactionTemplate.executeWithoutResult(status -> {
             JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
                     new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
-            boolean sameReportedFailure = normalizedCode.equals(job.errorCode())
-                    && normalizedMessage.equals(job.errorMessage())
-                    && job.leaseOwner() == null
-                    && ("FAILED".equals(job.status()) || "WAITING".equals(job.status()));
-            if (sameReportedFailure) {
-                return;
-            }
             if ("SUCCESS".equals(job.status())) {
                 throw new ApiException("JOB_ALREADY_COMPLETED", 409, "Job has already completed");
             }
+            boolean sameReportedFailure = normalizedCode.equals(job.errorCode())
+                    && normalizedMessage.equals(job.errorMessage())
+                    && ("FAILED".equals(job.status()) || "WAITING".equals(job.status()));
+            if (sameReportedFailure) {
+                ensureFailureIdempotencyLease(job, owner);
+                return;
+            }
             ensureCurrentLease(job, owner);
             Instant now = Instant.now();
-            boolean retryable = RETRYABLE_FAILURE_CODES.contains(normalizedCode);
-            String nextRetryAt = retryable
-                    ? Timestamp.from(now.plusSeconds(retryDelaySeconds(1))).toString()
-                    : null;
+            boolean controlPlaneFailure = CONTROL_PLANE_FAILURE_CODES.contains(normalizedCode);
+            boolean retryable = !controlPlaneFailure && RETRYABLE_FAILURE_CODES.contains(normalizedCode);
+            Timestamp nextRetryAt = retryable
+                    ? Timestamp.from(now.plusSeconds(retryDelaySeconds(1))) : null;
             String targetStatus = retryable ? "WAITING" : "FAILED";
+            if (controlPlaneFailure) {
+                targetStatus = "WAITING";
+            }
+            String retainedLeaseOwner = controlPlaneFailure ? null : owner;
+            Timestamp retainedLeaseExpiresAt = controlPlaneFailure || job.leaseExpiresAt() == null
+                    ? null : Timestamp.from(job.leaseExpiresAt());
             jdbcTemplate.update("""
                     UPDATE generation_job
                     SET status = ?,
-                        lease_owner = NULL,
-                        lease_expires_at = NULL,
+                        lease_owner = ?,
+                        lease_expires_at = ?,
                         heartbeat_at = NULL,
                         error_code = ?,
                         error_message = ?,
-                        next_retry_at = ?::timestamptz,
+                        next_retry_at = ?,
                         finished_at = CASE WHEN ? = 'FAILED' THEN ? ELSE finished_at END,
                         updated_at = ?
-                    WHERE id = ?
-                    """, targetStatus, normalizedCode, normalizedMessage, nextRetryAt,
-                    targetStatus, Timestamp.from(now), Timestamp.from(now), jobId);
+                        WHERE id = ?
+                    """, targetStatus, retainedLeaseOwner, retainedLeaseExpiresAt,
+                    normalizedCode, normalizedMessage, nextRetryAt, targetStatus,
+                    Timestamp.from(now), Timestamp.from(now), jobId);
             jdbcTemplate.update("""
                     UPDATE chapter
                     SET status = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND status <> 'SUCCESS'
-                    """, retryable ? "WAITING" : "FAILED", job.chapterId());
+                    """, controlPlaneFailure || retryable ? "WAITING" : "FAILED", job.chapterId());
+            if (controlPlaneFailure) {
+                jdbcTemplate.update("""
+                        UPDATE book
+                        SET status = 'PAUSED', updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status = 'RUNNING'
+                        """, job.bookId());
+                invalidateBookLeases(job.bookId());
+            }
         });
     }
 
@@ -414,6 +464,7 @@ public class JobService {
         JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
                 new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
         if ("SUCCESS".equals(job.status())) {
+            ensureCompletedResultLease(job, workerId);
             if (metadata.idempotencyKey().equals(job.resultIdempotencyKey())) {
                 return;
             }
@@ -434,8 +485,8 @@ public class JobService {
         int updated = jdbcTemplate.update("""
                 UPDATE generation_job
                 SET status = 'SUCCESS',
-                    lease_owner = NULL,
-                    lease_expires_at = NULL,
+                    lease_owner = ?,
+                    lease_expires_at = ?,
                     heartbeat_at = NULL,
                     error_code = NULL,
                     error_message = NULL,
@@ -444,7 +495,9 @@ public class JobService {
                     result_idempotency_key = ?,
                     updated_at = ?
                 WHERE id = ?
-                """, Timestamp.from(now), metadata.idempotencyKey(), Timestamp.from(now), jobId);
+                """, workerId,
+                job.leaseExpiresAt() == null ? null : Timestamp.from(job.leaseExpiresAt()),
+                Timestamp.from(now), metadata.idempotencyKey(), Timestamp.from(now), jobId);
         if (updated != 1) {
             throw new ApiException("RESULT_CONFLICT", 409, "Job result could not be recorded");
         }
@@ -503,10 +556,7 @@ public class JobService {
         if (metadata == null || !metadata.isObject()) {
             throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
         }
-        String declaredSha256 = text(metadata, "sha256");
-        if (declaredSha256 != null && declaredSha256.length() > 64) {
-            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
-        }
+        String declaredSha256 = declaredSha256(metadata);
         Long declaredSizeBytes = longValue(metadata, "sizeBytes", "size_bytes");
         if (declaredSizeBytes != null && declaredSizeBytes < 0) {
             throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
@@ -516,7 +566,7 @@ public class JobService {
         if (!format.matches("[a-z0-9]{1,16}")) {
             throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
         }
-        Long durationMs = longValue(metadata, "durationMs", "duration_ms");
+        Long durationMs = durationMilliseconds(metadata);
         Integer sampleRate = intValue(metadata, "sampleRate", "sample_rate");
         Integer channels = intValue(metadata, "channels");
         if ((durationMs != null && durationMs < 0)
@@ -530,6 +580,66 @@ public class JobService {
         }
         return new ParsedResultMetadata(declaredSha256, declaredSizeBytes, format, durationMs,
                 sampleRate, channels, idempotencyKey, null, null);
+    }
+
+    private String declaredSha256(JsonNode metadata) {
+        JsonNode value = metadata.get("sha256");
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isTextual() || !value.textValue().matches("[0-9a-fA-F]{64}")) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        return value.textValue().toLowerCase(Locale.ROOT);
+    }
+
+    private Long durationMilliseconds(JsonNode metadata) {
+        Long durationMs = longValue(metadata, "durationMs", "duration_ms");
+        if (durationMs != null && durationMs < 0) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+
+        BigDecimal durationSeconds = decimalValue(metadata, "durationSeconds", "duration_seconds");
+        Long secondsAsMilliseconds = null;
+        if (durationSeconds != null) {
+            if (durationSeconds.signum() < 0) {
+                throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+            }
+            try {
+                secondsAsMilliseconds = durationSeconds.multiply(BigDecimal.valueOf(1000))
+                        .setScale(0, RoundingMode.HALF_UP)
+                        .longValueExact();
+            } catch (ArithmeticException exception) {
+                throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+            }
+        }
+        if (durationMs != null && secondsAsMilliseconds != null
+                && !durationMs.equals(secondsAsMilliseconds)) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        return secondsAsMilliseconds == null ? durationMs : secondsAsMilliseconds;
+    }
+
+    private static BigDecimal decimalValue(JsonNode node, String... names) {
+        JsonNode value = null;
+        for (String name : names) {
+            JsonNode candidate = node.get(name);
+            if (candidate != null && !candidate.isNull()) {
+                value = candidate;
+                break;
+            }
+        }
+        if (value == null) {
+            return null;
+        }
+        if (!value.isNumber() && !value.isTextual()) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
+        try {
+            return new BigDecimal(value.asText());
+        } catch (NumberFormatException exception) {
+            throw new ApiException("INVALID_RESULT", 400, "Result metadata is invalid");
+        }
     }
 
     private ParsedResultMetadata validateResultMetadata(ParsedResultMetadata metadata,
@@ -594,12 +704,14 @@ public class JobService {
         List<JobRow> jobs = jdbcTemplate.query("""
                 SELECT gj.id, gj.status, gj.lease_owner, gj.lease_expires_at,
                        gj.chapter_id, c.chapter_number, bv.book_id, bv.id AS book_version_id,
-                       gj.segment_index, gj.error_code, gj.error_message, gj.result_idempotency_key
+                       gj.segment_index, gj.error_code, gj.error_message, gj.result_idempotency_key,
+                       b.status AS book_status
                 FROM generation_job gj
                 JOIN chapter c ON c.id = gj.chapter_id
                 JOIN book_version bv ON bv.id = c.book_version_id
+                JOIN book b ON b.id = bv.book_id
                 WHERE gj.id = ?
-                FOR UPDATE OF gj
+                FOR UPDATE OF gj, b
                 """, JOB_ROW_MAPPER, jobId);
         return jobs.stream().findFirst();
     }
@@ -621,8 +733,27 @@ public class JobService {
     }
 
     private void ensureCurrentLease(JobRow job, String workerId) {
-        if (!workerId.equals(job.leaseOwner())
+        if (!"RUNNING".equals(job.bookStatus())
+                || !workerId.equals(job.leaseOwner())
                 || !LEASED_STATUSES.contains(job.status())
+                || job.leaseExpiresAt() == null
+                || !job.leaseExpiresAt().isAfter(Instant.now())) {
+            throw leaseLost();
+        }
+    }
+
+    private void ensureCompletedResultLease(JobRow job, String workerId) {
+        if (!"RUNNING".equals(job.bookStatus())
+                || !workerId.equals(job.leaseOwner())
+                || job.leaseExpiresAt() == null
+                || !job.leaseExpiresAt().isAfter(Instant.now())) {
+            throw leaseLost();
+        }
+    }
+
+    private void ensureFailureIdempotencyLease(JobRow job, String workerId) {
+        if (!"RUNNING".equals(job.bookStatus())
+                || !workerId.equals(job.leaseOwner())
                 || job.leaseExpiresAt() == null
                 || !job.leaseExpiresAt().isAfter(Instant.now())) {
             throw leaseLost();
@@ -703,7 +834,11 @@ public class JobService {
         if (code == null || !code.matches("[A-Za-z0-9_.-]{1,128}")) {
             throw new ApiException("INVALID_FAILURE", 400, "Failure code is invalid");
         }
-        return code.toUpperCase(Locale.ROOT);
+        String normalized = code.toUpperCase(Locale.ROOT);
+        if (!FailureSanitizer.isAllowedCode(normalized)) {
+            throw new ApiException("INVALID_FAILURE", 400, "Failure code is invalid");
+        }
+        return normalized;
     }
 
     private String normalizeFailureMessage(String message) {
@@ -711,15 +846,7 @@ public class JobService {
             throw new ApiException("INVALID_FAILURE", 400, "Failure message is invalid");
         }
         String normalized = message.trim();
-        if (normalized.length() > 2000) {
-            normalized = normalized.substring(0, 2000);
-        }
-        String key = normalizeKey(normalized);
-        if (key.contains("cloneprompt") || key.contains("workertoken")
-                || key.contains("enrollmenttoken") || key.contains("accesstoken")) {
-            return "Worker reported a failure";
-        }
-        return normalized;
+        return FailureSanitizer.sanitizeSummary(normalized);
     }
 
     private int readInt(Map<String, Object> request, int defaultValue, String... keys) {
@@ -866,7 +993,7 @@ public class JobService {
     private record JobRow(long id, String status, String leaseOwner, Instant leaseExpiresAt,
                           long chapterId, int chapterNumber, long bookId, long bookVersionId,
                           int segmentIndex, String errorCode, String errorMessage,
-                          String resultIdempotencyKey) {
+                          String resultIdempotencyKey, String bookStatus) {
     }
 
     private record StagedResult(Path path, String sha256, long sizeBytes) {

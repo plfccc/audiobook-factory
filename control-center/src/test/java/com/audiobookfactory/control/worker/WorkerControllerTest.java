@@ -16,6 +16,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -160,12 +162,14 @@ class WorkerControllerTest {
                 .andExpect(status().isOk());
 
         byte[] audio = "not-a-real-wav-but-a-deterministic-result".getBytes(StandardCharsets.UTF_8);
+        String resultSha256 = HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(audio));
         var multipart = new org.springframework.mock.web.MockMultipartFile(
                 "audio", "result.wav", "audio/wav", audio);
         mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart(
                                 "/api/v1/workers/jobs/1/result")
                         .file(multipart)
-                        .param("metadata", "{\"sha256\":\"result-hash\",\"sizeBytes\":" + audio.length + "}")
+                        .param("metadata", "{\"sha256\":\"" + resultSha256 + "\",\"sizeBytes\":" + audio.length + "}")
                         .header("Authorization", "Bearer " + workerToken))
                 .andExpect(status().isNoContent());
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM generation_job WHERE id=1", String.class))
@@ -175,7 +179,7 @@ class WorkerControllerTest {
         mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart(
                                 "/api/v1/workers/jobs/1/result")
                         .file(multipart)
-                        .param("metadata", "{\"sha256\":\"result-hash\",\"sizeBytes\":" + audio.length + "}")
+                        .param("metadata", "{\"sha256\":\"" + resultSha256 + "\",\"sizeBytes\":" + audio.length + "}")
                         .header("Authorization", "Bearer " + workerToken))
                 .andExpect(status().isNoContent());
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM audio_asset WHERE job_id=1", Integer.class))
@@ -184,7 +188,7 @@ class WorkerControllerTest {
         mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart(
                                 "/api/v1/workers/jobs/1/result")
                         .file(multipart)
-                        .param("metadata", "{\"sha256\":\"different-result\",\"sizeBytes\":" + audio.length + "}")
+                        .param("metadata", "{\"sha256\":\"" + "b".repeat(64) + "\",\"sizeBytes\":" + audio.length + "}")
                         .header("Authorization", "Bearer " + workerToken))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("RESULT_IDEMPOTENCY_CONFLICT"));

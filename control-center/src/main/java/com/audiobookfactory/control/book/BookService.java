@@ -1,6 +1,7 @@
 package com.audiobookfactory.control.book;
 
 import com.audiobookfactory.control.ApiException;
+import com.audiobookfactory.control.job.FailureSanitizer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -145,8 +146,8 @@ public class BookService {
                 trim(resultSet.getString("text_sha256")),
                 resultSet.getString("status"),
                 resultSet.getInt("attempts"),
-                resultSet.getString("error_code"),
-                resultSet.getString("error_message")),
+                FailureSanitizer.sanitizeCode(resultSet.getString("error_code")),
+                FailureSanitizer.sanitizeSummary(resultSet.getString("error_message"))),
                 bookId, chapterReference, chapterReference);
         if (!segments.isEmpty()) {
             return segments;

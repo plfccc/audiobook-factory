@@ -631,11 +631,18 @@ public class JobService implements ChapterCompletionPort {
                     new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
             if ("SUCCESS".equals(job.status())) {
                 ensureCompletedResultLease(job, workerId);
+                // 生成结果已经是不可变且已验证的资产；发布失败只需等待后续幂等重试，
+                // 不能把 job 退回 WAITING，否则下一次上传可能被旧资产的 SHA/大小挡住。
+                jdbcTemplate.update("""
+                        UPDATE chapter
+                        SET status = 'WAITING', updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status <> 'SUCCESS'
+                        """, job.chapterId());
             } else {
                 ensureCurrentLease(job, workerId);
+                markJobWaiting(job.id(), job.chapterId(), retryableCode(errorCode),
+                        "Chapter publish is retryable");
             }
-            markJobWaiting(job.id(), job.chapterId(), retryableCode(errorCode),
-                    "Chapter publish is retryable");
         });
     }
 
@@ -1312,7 +1319,7 @@ public class JobService implements ChapterCompletionPort {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException exception) {
-            Files.move(source, target);
+            throw new IOException("Atomic result promotion is not supported", exception);
         }
     }
 

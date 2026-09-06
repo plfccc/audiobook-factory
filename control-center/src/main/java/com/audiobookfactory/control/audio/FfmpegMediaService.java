@@ -1,8 +1,10 @@
 package com.audiobookfactory.control.audio;
 
+import com.audiobookfactory.control.config.AppProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -52,8 +54,10 @@ public class FfmpegMediaService {
     private final AtomicFileMover fileMover;
 
     @Autowired
-    public FfmpegMediaService() {
-        this(new MediaToolRunner());
+    public FfmpegMediaService(AppProperties appProperties,
+                               @Value("${audiobookshelf.library-root}") Path libraryRoot) {
+        this(new MediaToolRunner(), Objects.requireNonNull(appProperties,
+                        "appProperties must not be null").storageRoot(), libraryRoot);
     }
 
     public FfmpegMediaService(MediaToolRunner toolRunner) {
@@ -363,30 +367,38 @@ public class FfmpegMediaService {
             }
             JsonNode formatNode = root.path("format");
             String formatName = text(formatNode.path("format_name"));
-            double duration = decimal(formatNode.path("duration"));
-            if (!Double.isFinite(duration) || duration <= 0) {
-                duration = streamDuration(root.path("streams"));
-            }
-            if (!Double.isFinite(duration) || duration <= 0) {
-                throw new InvalidProbeException("ffprobe returned a non-positive duration");
-            }
             JsonNode streams = root.path("streams");
             if (!streams.isArray() || streams.isEmpty()) {
                 throw new InvalidProbeException("ffprobe returned no audio stream");
             }
+            JsonNode audioStream = null;
             for (JsonNode stream : streams) {
                 String codecType = text(stream.path("codec_type"));
-                if (codecType != null && !"audio".equalsIgnoreCase(codecType)) {
+                if (!"audio".equalsIgnoreCase(codecType)) {
                     continue;
                 }
-                String codec = text(stream.path("codec_name"));
-                int sampleRate = positiveInt(stream.path("sample_rate"));
-                int channels = positiveInt(stream.path("channels"));
-                if (codec != null && sampleRate > 0 && channels > 0) {
-                    return new ProbeMetadata(formatName, codec, sampleRate, channels, duration);
+                if (audioStream != null) {
+                    throw new InvalidProbeException("ffprobe returned multiple ambiguous audio streams");
                 }
+                audioStream = stream;
             }
-            throw new InvalidProbeException("ffprobe audio stream is missing required fields");
+            if (audioStream == null) {
+                throw new InvalidProbeException("ffprobe returned no audio stream");
+            }
+            String codec = text(audioStream.path("codec_name"));
+            int sampleRate = positiveInt(audioStream.path("sample_rate"));
+            int channels = positiveInt(audioStream.path("channels"));
+            if (codec == null || sampleRate <= 0 || channels <= 0) {
+                throw new InvalidProbeException("ffprobe audio stream is missing required fields");
+            }
+            double duration = streamDuration(audioStream);
+            if (!Double.isFinite(duration) || duration <= 0) {
+                duration = decimal(formatNode.path("duration"));
+            }
+            if (!Double.isFinite(duration) || duration <= 0) {
+                throw new InvalidProbeException("ffprobe returned a non-positive audio duration");
+            }
+            return new ProbeMetadata(formatName, codec, sampleRate, channels, duration);
         } catch (InvalidProbeException exception) {
             throw exception;
         } catch (IOException | RuntimeException exception) {
@@ -394,13 +406,11 @@ public class FfmpegMediaService {
         }
     }
 
-    private double streamDuration(JsonNode streams) {
-        if (streams.isArray()) {
-            for (JsonNode stream : streams) {
-                double duration = decimal(stream.path("duration"));
-                if (Double.isFinite(duration) && duration > 0) {
-                    return duration;
-                }
+    private double streamDuration(JsonNode stream) {
+        if (stream != null && stream.isObject()) {
+            double duration = decimal(stream.path("duration"));
+            if (Double.isFinite(duration) && duration > 0) {
+                return duration;
             }
         }
         return Double.NaN;
@@ -543,7 +553,7 @@ public class FfmpegMediaService {
     }
 
     private boolean within(Path path, Path root) {
-        return root == null || path.startsWith(root);
+        return root != null && path.startsWith(root);
     }
 
     private AudioValidationResult invalid(String code, String message) {

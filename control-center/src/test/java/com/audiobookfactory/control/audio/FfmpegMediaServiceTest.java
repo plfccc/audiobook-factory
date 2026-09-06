@@ -42,7 +42,7 @@ class FfmpegMediaServiceTest {
         Path wav = directory.resolve("voice.wav");
         Files.write(wav, new byte[2048]);
         FakeMediaToolRunner runner = new FakeMediaToolRunner();
-        FfmpegMediaService mediaService = new FfmpegMediaService(runner);
+        FfmpegMediaService mediaService = new FfmpegMediaService(runner, directory, directory);
 
         AudioValidationResult result = mediaService.validate(wav);
 
@@ -63,7 +63,7 @@ class FfmpegMediaServiceTest {
                 .resolve("voice.wav"));
         FakeMediaToolRunner runner = new FakeMediaToolRunner();
 
-        new FfmpegMediaService(runner).validate(wav);
+        new FfmpegMediaService(runner, wav.getParent(), wav.getParent()).validate(wav);
 
         assertThat(runner.calls().get(0)).contains(
                 "format=duration,format_name:stream=codec_type,codec_name,sample_rate,channels");
@@ -77,7 +77,7 @@ class FfmpegMediaServiceTest {
                 {"format":{"format_name":"wav","duration":"1.25"},"streams":[{"codec_type":"audio","codec_name":"aac","sample_rate":"24000","channels":1}]}
                 """);
 
-        AudioValidationResult result = new FfmpegMediaService(runner).validate(wav);
+        AudioValidationResult result = new FfmpegMediaService(runner, directory, directory).validate(wav);
 
         assertThat(result.valid()).isFalse();
         assertThat(result.errorCode()).isEqualTo(FfmpegMediaService.AUDIO_INVALID);
@@ -91,7 +91,40 @@ class FfmpegMediaServiceTest {
                 {"format":{"format_name":"wav","duration":"1.25"},"streams":[{"codec_type":"video","codec_name":"pcm_s16le","sample_rate":"24000","channels":1}]}
                 """);
 
-        AudioValidationResult result = new FfmpegMediaService(runner).validate(wav);
+        AudioValidationResult result = new FfmpegMediaService(runner, directory, directory).validate(wav);
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.errorCode()).isEqualTo(FfmpegMediaService.AUDIO_INVALID);
+    }
+
+    @Test
+    void rejectsProbeWithoutExplicitAudioCodecType() throws IOException {
+        Path directory = Files.createTempDirectory("audio-missing-codec-type-");
+        Path wav = writeAudio(directory.resolve("voice.wav"));
+        FakeMediaToolRunner runner = new FakeMediaToolRunner("""
+                {"format":{"format_name":"wav","duration":"1.25"},"streams":[{"codec_name":"pcm_s16le","sample_rate":"24000","channels":1}]}
+                """);
+
+        AudioValidationResult result = new FfmpegMediaService(runner, directory, directory)
+                .validate(wav);
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.errorCode()).isEqualTo(FfmpegMediaService.AUDIO_INVALID);
+    }
+
+    @Test
+    void doesNotUseDurationFromANonAudioStream() throws IOException {
+        Path directory = Files.createTempDirectory("audio-non-audio-duration-");
+        Path wav = writeAudio(directory.resolve("voice.wav"));
+        FakeMediaToolRunner runner = new FakeMediaToolRunner("""
+                {"format":{"format_name":"wav"},"streams":[
+                  {"codec_type":"video","duration":"1.25","codec_name":"h264"},
+                  {"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"24000","channels":1}
+                ]}
+                """);
+
+        AudioValidationResult result = new FfmpegMediaService(runner, directory, directory)
+                .validate(wav);
 
         assertThat(result.valid()).isFalse();
         assertThat(result.errorCode()).isEqualTo(FfmpegMediaService.AUDIO_INVALID);
@@ -105,7 +138,7 @@ class FfmpegMediaServiceTest {
                 {"format":{"format_name":"wav","duration":"1.25"},"streams":[{"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"192000","channels":6}]}
                 """);
 
-        AudioValidationResult result = new FfmpegMediaService(runner).validate(wav);
+        AudioValidationResult result = new FfmpegMediaService(runner, directory, directory).validate(wav);
 
         assertThat(result.valid()).isFalse();
         assertThat(result.errorCode()).isEqualTo(FfmpegMediaService.AUDIO_INVALID);
@@ -117,7 +150,7 @@ class FfmpegMediaServiceTest {
         Path wav = writeAudio(directory.resolve("voice.wav"));
         FakeMediaToolRunner runner = new FakeMediaToolRunner();
 
-        new FfmpegMediaService(runner).validate(wav);
+        new FfmpegMediaService(runner, directory, directory).validate(wav);
 
         List<String> decode = runner.calls().stream()
                 .filter(call -> "ffmpeg".equals(call.get(0)) && !call.contains("-filter_complex"))
@@ -226,7 +259,7 @@ class FfmpegMediaServiceTest {
         Path second = writeAudio(directory.resolve("segment-2.wav"));
         Path output = directory.resolve("chapter.mp3");
         FakeMediaToolRunner runner = new FakeMediaToolRunner();
-        FfmpegMediaService mediaService = new FfmpegMediaService(runner);
+        FfmpegMediaService mediaService = new FfmpegMediaService(runner, directory, directory);
 
         Path merged = mediaService.mergeChapter(
                 List.of(first, second), output,
@@ -252,7 +285,7 @@ class FfmpegMediaServiceTest {
         Path first = writeAudio(libraryRoot.resolve("segment-1.wav"));
         Path second = writeAudio(libraryRoot.resolve("segment-2.wav"));
         FakeMediaToolRunner runner = new FakeMediaToolRunner();
-        FfmpegMediaService mediaService = new FfmpegMediaService(runner);
+        FfmpegMediaService mediaService = new FfmpegMediaService(runner, libraryRoot, libraryRoot);
         LibraryPublishService.Chapter chapter =
                 new LibraryPublishService.Chapter("测试书", 1, "第一/章");
         LibraryPublishService.AudioAsset firstAsset =
@@ -275,7 +308,8 @@ class FfmpegMediaServiceTest {
     @Test
     void rejectsNullChapterAssetWithClassifiedError() throws IOException {
         Path libraryRoot = Files.createTempDirectory("audiobookshelf-invalid-assets-");
-        FfmpegMediaService mediaService = new FfmpegMediaService(new FakeMediaToolRunner());
+        FfmpegMediaService mediaService = new FfmpegMediaService(
+                new FakeMediaToolRunner(), libraryRoot, libraryRoot);
         LibraryPublishService publisher = new LibraryPublishService(
                 mediaService, libraryRoot, ignored -> { });
 

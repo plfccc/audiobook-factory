@@ -54,12 +54,19 @@ class JobServiceAudioPipelineTest {
 
     private JobService service;
     private boolean chapterReady;
+    private String jobStatus = "LEASED";
 
     @BeforeEach
     void setUp() throws Exception {
         lenient().when(transactionManager.getTransaction(any(TransactionDefinition.class)))
                 .thenReturn(transactionStatus);
-        lenient().when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
+        lenient().doAnswer(invocation -> {
+            String sql = invocation.getArgument(0, String.class);
+            if (sql.contains("SET status = 'SUCCESS'")) {
+                jobStatus = "SUCCESS";
+            }
+            return 1;
+        }).when(jdbcTemplate).update(anyString(), any(Object[].class));
         stubJobRow();
         service = new JobService(jdbcTemplate, transactionManager, new ObjectMapper(),
                 Path.of("target", "job-service-audio-pipeline-test"),
@@ -118,6 +125,32 @@ class JobServiceAudioPipelineTest {
         verify(libraryPublishService, never()).publishChapter(any(), any());
     }
 
+    @Test
+    void retriesPublishIdempotentlyAfterAnAlreadyStoredSegment() throws Exception {
+        byte[] audio = new byte[2048];
+        String sha256 = sha256(audio);
+        Path published = Path.of("target", "job-service-audio-pipeline-test", "library", "001.mp3")
+                .toAbsolutePath().normalize();
+        when(mediaService.validate(any(Path.class))).thenReturn(
+                AudioValidationResult.valid(2048, 1.25, "pcm_s16le", 24_000, 1, sha256));
+        chapterReady = true;
+        when(libraryPublishService.publishChapter(any(), any()))
+                .thenThrow(new LibraryPublishService.PublishException(
+                        "AUDIOBOOKSHELF_SCAN_FAILED", "scan failed"))
+                .thenReturn(published);
+        MockMultipartFile result = new MockMultipartFile(
+                "audio", "result.wav", "audio/wav", audio);
+        String metadata = "{\"sha256\":\"" + sha256
+                + "\",\"sizeBytes\":2048,\"idempotencyKey\":\"idem-1\"}";
+
+        assertThatThrownBy(() -> service.recordResult(1, "worker-1", result, metadata))
+                .isInstanceOf(ApiException.class);
+
+        service.recordResult(1, "worker-1", result, metadata);
+
+        verify(libraryPublishService, org.mockito.Mockito.times(2)).publishChapter(any(), any());
+    }
+
     private void stubJobRow() throws Exception {
         ResultSet jobRow = org.mockito.Mockito.mock(ResultSet.class);
         lenient().when(jobRow.getLong(anyString())).thenAnswer(invocation -> switch (
@@ -135,9 +168,10 @@ class JobServiceAudioPipelineTest {
         });
         lenient().when(jobRow.getString(anyString())).thenAnswer(invocation -> switch (
                 invocation.getArgument(0, String.class)) {
-            case "status" -> "LEASED";
+            case "status" -> jobStatus;
             case "lease_owner" -> "worker-1";
             case "book_status" -> "RUNNING";
+            case "result_idempotency_key" -> "idem-1";
             default -> null;
         });
         lenient().when(jobRow.getTimestamp("lease_expires_at"))

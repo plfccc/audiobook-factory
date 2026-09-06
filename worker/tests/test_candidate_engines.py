@@ -391,3 +391,28 @@ def test_f5_loader_passes_local_checkpoint_without_enabling_download(tmp_path: P
         "vocoder_local_path": str(tmp_path / "vocos"),
         "device": "cuda:0",
     }
+
+
+def test_cosyvoice_loader_uses_cosvoice3_constructor_contract(tmp_path: Path, monkeypatch):
+    from audiobook_worker.cosyvoice_engine import _CosyVoiceLoader
+
+    (tmp_path / "cosyvoice3.yaml").write_text("model: test\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class CosyVoice3:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "cosyvoice", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cosyvoice.cli", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "cosyvoice.cli.cosyvoice",
+        SimpleNamespace(CosyVoice3=CosyVoice3),
+    )
+    _CosyVoiceLoader(tmp_path).load("FunAudioLLM/Fun-CosyVoice3-0.5B-2512", "cuda:0")
+
+    assert captured == {
+        "model_dir": str(tmp_path),
+        "load_trt": False,
+    }

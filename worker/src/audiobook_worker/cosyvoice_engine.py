@@ -72,7 +72,7 @@ class _CosyVoiceLoader:
             from cosyvoice.cli.cosyvoice import CosyVoice3
         except ImportError as exc:
             raise RuntimeError("cosyvoice dependency is required for CosyVoice3") from exc
-        model = CosyVoice3(model_dir=str(self.model_path), load_jit=False, load_trt=False)
+        model = CosyVoice3(model_dir=str(self.model_path), load_trt=False)
         return _CosyVoiceModelApi(model)
 
 

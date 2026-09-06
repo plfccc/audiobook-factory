@@ -30,10 +30,15 @@ public class FfmpegMediaService {
     public static final String MEDIA_TOOL_TIMEOUT = "MEDIA_TOOL_TIMEOUT";
     public static final String MEDIA_TOOL_UNAVAILABLE = "MEDIA_TOOL_UNAVAILABLE";
     public static final String MEDIA_MERGE_FAILED = "MEDIA_MERGE_FAILED";
+    public static final String MEDIA_PROMOTION_UNSUPPORTED = "MEDIA_PROMOTION_UNSUPPORTED";
     public static final long DEFAULT_MINIMUM_AUDIO_BYTES = 1024;
     public static final double DEFAULT_MINIMUM_DURATION_SECONDS = 0.01;
     public static final int DEFAULT_SAMPLE_RATE = 24_000;
     public static final int DEFAULT_CHANNELS = 1;
+
+    private static final int MIN_SAMPLE_RATE = 8_000;
+    private static final int MAX_SAMPLE_RATE = 96_000;
+    private static final int MAX_CHANNELS = 2;
 
     private final MediaToolRunner toolRunner;
     private final ObjectMapper objectMapper;
@@ -42,6 +47,9 @@ public class FfmpegMediaService {
     private final Duration timeout;
     private final long minimumAudioBytes;
     private final double minimumDurationSeconds;
+    private final Path storageRoot;
+    private final Path libraryRoot;
+    private final AtomicFileMover fileMover;
 
     @Autowired
     public FfmpegMediaService() {
@@ -50,13 +58,37 @@ public class FfmpegMediaService {
 
     public FfmpegMediaService(MediaToolRunner toolRunner) {
         this(toolRunner, new ObjectMapper(), "ffprobe", "ffmpeg", MediaToolRunner.DEFAULT_TIMEOUT,
-                DEFAULT_MINIMUM_AUDIO_BYTES, DEFAULT_MINIMUM_DURATION_SECONDS);
+                DEFAULT_MINIMUM_AUDIO_BYTES, DEFAULT_MINIMUM_DURATION_SECONDS,
+                null, null, FfmpegMediaService::moveAtomically);
     }
 
     public FfmpegMediaService(MediaToolRunner toolRunner, ObjectMapper objectMapper,
                               String ffprobeExecutable, String ffmpegExecutable,
                               Duration timeout, long minimumAudioBytes,
                               double minimumDurationSeconds) {
+        this(toolRunner, objectMapper, ffprobeExecutable, ffmpegExecutable, timeout,
+                minimumAudioBytes, minimumDurationSeconds, null, null,
+                FfmpegMediaService::moveAtomically);
+    }
+
+    public FfmpegMediaService(MediaToolRunner toolRunner, Path storageRoot, Path libraryRoot) {
+        this(toolRunner, new ObjectMapper(), "ffprobe", "ffmpeg", MediaToolRunner.DEFAULT_TIMEOUT,
+                DEFAULT_MINIMUM_AUDIO_BYTES, DEFAULT_MINIMUM_DURATION_SECONDS,
+                storageRoot, libraryRoot, FfmpegMediaService::moveAtomically);
+    }
+
+    public FfmpegMediaService(MediaToolRunner toolRunner, Path storageRoot, Path libraryRoot,
+                              AtomicFileMover fileMover) {
+        this(toolRunner, new ObjectMapper(), "ffprobe", "ffmpeg", MediaToolRunner.DEFAULT_TIMEOUT,
+                DEFAULT_MINIMUM_AUDIO_BYTES, DEFAULT_MINIMUM_DURATION_SECONDS,
+                storageRoot, libraryRoot, fileMover);
+    }
+
+    private FfmpegMediaService(MediaToolRunner toolRunner, ObjectMapper objectMapper,
+                               String ffprobeExecutable, String ffmpegExecutable,
+                               Duration timeout, long minimumAudioBytes,
+                               double minimumDurationSeconds, Path storageRoot,
+                               Path libraryRoot, AtomicFileMover fileMover) {
         this.toolRunner = Objects.requireNonNull(toolRunner, "toolRunner must not be null");
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
         this.ffprobeExecutable = executable(ffprobeExecutable, "ffprobeExecutable");
@@ -73,6 +105,9 @@ public class FfmpegMediaService {
         }
         this.minimumAudioBytes = minimumAudioBytes;
         this.minimumDurationSeconds = minimumDurationSeconds;
+        this.storageRoot = normalizeRoot(storageRoot);
+        this.libraryRoot = normalizeRoot(libraryRoot);
+        this.fileMover = Objects.requireNonNull(fileMover, "fileMover must not be null");
     }
 
     public AudioValidationResult validate(Path wav) {
@@ -81,7 +116,9 @@ public class FfmpegMediaService {
         }
         try {
             Path path = normalize(wav);
-            if (containsSymbolicLink(path) || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+            if (!within(path, storageRoot)
+                    || containsSymbolicLink(path)
+                    || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
                 return invalid(AUDIO_INVALID, "Audio file is missing or not a regular file");
             }
             BasicFileAttributes attributes = Files.readAttributes(
@@ -99,6 +136,9 @@ public class FfmpegMediaService {
                 return invalid(AUDIO_INVALID, "ffprobe rejected the audio file");
             }
             ProbeMetadata metadata = parseProbe(probe.stdout());
+            if (!supportedAudio(metadata)) {
+                return invalid(AUDIO_INVALID, "ffprobe returned unsupported audio metadata");
+            }
             if (metadata.durationSeconds() < minimumDurationSeconds) {
                 return invalid(AUDIO_INVALID, "Audio duration is below the minimum");
             }
@@ -140,6 +180,10 @@ public class FfmpegMediaService {
         }
         Objects.requireNonNull(metadata, "metadata must not be null");
         Path output = normalizeOutput(outputMp3);
+        if (!within(output, libraryRoot)) {
+            throw new MediaPipelineException("OUTPUT_PATH_INVALID",
+                    "Output path is outside the configured library root");
+        }
         ensureOutputCanBeWritten(output);
 
         List<Path> inputs = new ArrayList<>(orderedWavFiles.size());
@@ -162,6 +206,7 @@ public class FfmpegMediaService {
             Files.createDirectories(parent);
             ensureOutputCanBeWritten(output);
             Path temporary = Files.createTempFile(parent, "." + output.getFileName() + "-", ".mp3");
+            boolean preserveTemporary = false;
             try {
                 MediaToolRunner.CommandResult result = run(mergeArguments(inputs, temporary, metadata));
                 if (result.timedOut()) {
@@ -181,7 +226,12 @@ public class FfmpegMediaService {
                     throw new MediaPipelineException(mergedValidation.errorCode(),
                             "Merged chapter audio is invalid: " + mergedValidation.errorCode());
                 }
-                promote(temporary, output);
+                try {
+                    promote(temporary, output);
+                } catch (MediaPipelineException exception) {
+                    preserveTemporary = MEDIA_PROMOTION_UNSUPPORTED.equals(exception.code());
+                    throw exception;
+                }
                 if (containsSymbolicLink(output)
                         || !Files.isRegularFile(output, LinkOption.NOFOLLOW_LINKS)) {
                     throw new MediaPipelineException(MEDIA_MERGE_FAILED,
@@ -189,7 +239,9 @@ public class FfmpegMediaService {
                 }
                 return output;
             } finally {
-                Files.deleteIfExists(temporary);
+                if (!preserveTemporary) {
+                    Files.deleteIfExists(temporary);
+                }
             }
         } catch (MediaPipelineException exception) {
             throw exception;
@@ -214,11 +266,13 @@ public class FfmpegMediaService {
 
     private List<String> probeArguments(Path path) {
         return List.of(ffprobeExecutable, "-v", "error", "-show_entries",
-                "format=duration:stream=codec_name,sample_rate,channels", "-of", "json", path.toString());
+                "format=duration,format_name:stream=codec_type,codec_name,sample_rate,channels",
+                "-of", "json", path.toString());
     }
 
     private List<String> decodeArguments(Path path) {
-        return List.of(ffmpegExecutable, "-v", "error", "-i", path.toString(), "-f", "null", "-");
+        return List.of(ffmpegExecutable, "-v", "error", "-xerror", "-i", path.toString(),
+                "-f", "null", "-");
     }
 
     private List<String> mergeArguments(List<Path> inputs, Path output, ChapterMetadata metadata) {
@@ -307,7 +361,9 @@ public class FfmpegMediaService {
             if (root == null || !root.isObject()) {
                 throw new InvalidProbeException("ffprobe returned malformed metadata");
             }
-            double duration = decimal(root.path("format").path("duration"));
+            JsonNode formatNode = root.path("format");
+            String formatName = text(formatNode.path("format_name"));
+            double duration = decimal(formatNode.path("duration"));
             if (!Double.isFinite(duration) || duration <= 0) {
                 duration = streamDuration(root.path("streams"));
             }
@@ -319,11 +375,15 @@ public class FfmpegMediaService {
                 throw new InvalidProbeException("ffprobe returned no audio stream");
             }
             for (JsonNode stream : streams) {
+                String codecType = text(stream.path("codec_type"));
+                if (codecType != null && !"audio".equalsIgnoreCase(codecType)) {
+                    continue;
+                }
                 String codec = text(stream.path("codec_name"));
                 int sampleRate = positiveInt(stream.path("sample_rate"));
                 int channels = positiveInt(stream.path("channels"));
                 if (codec != null && sampleRate > 0 && channels > 0) {
-                    return new ProbeMetadata(codec, sampleRate, channels, duration);
+                    return new ProbeMetadata(formatName, codec, sampleRate, channels, duration);
                 }
             }
             throw new InvalidProbeException("ffprobe audio stream is missing required fields");
@@ -466,11 +526,24 @@ public class FfmpegMediaService {
 
     private void promote(Path temporary, Path output) throws IOException {
         try {
-            Files.move(temporary, output, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
+            fileMover.move(temporary, output);
         } catch (AtomicMoveNotSupportedException exception) {
-            Files.move(temporary, output, StandardCopyOption.REPLACE_EXISTING);
+            throw new MediaPipelineException(MEDIA_PROMOTION_UNSUPPORTED,
+                    "Atomic chapter promotion is not supported", exception);
         }
+    }
+
+    private static void moveAtomically(Path source, Path target) throws IOException {
+        Files.move(source, target, StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private Path normalizeRoot(Path root) {
+        return root == null ? null : normalize(root);
+    }
+
+    private boolean within(Path path, Path root) {
+        return root == null || path.startsWith(root);
     }
 
     private AudioValidationResult invalid(String code, String message) {
@@ -484,7 +557,27 @@ public class FfmpegMediaService {
         return value.trim();
     }
 
-    private record ProbeMetadata(String codec, int sampleRate, int channels, double durationSeconds) {
+    private boolean supportedAudio(ProbeMetadata metadata) {
+        if (metadata.sampleRate() < MIN_SAMPLE_RATE || metadata.sampleRate() > MAX_SAMPLE_RATE
+                || metadata.channels() <= 0 || metadata.channels() > MAX_CHANNELS) {
+            return false;
+        }
+        String codec = metadata.codec().toLowerCase(Locale.ROOT);
+        String format = metadata.formatName() == null
+                ? "" : metadata.formatName().toLowerCase(Locale.ROOT);
+        if ("mp3".equals(format) || "mp3".equals(codec)) {
+            return "mp3".equals(codec);
+        }
+        return codec.startsWith("pcm_") && (format.isBlank() || format.contains("wav"));
+    }
+
+    private record ProbeMetadata(String formatName, String codec, int sampleRate, int channels,
+                                 double durationSeconds) {
+    }
+
+    @FunctionalInterface
+    public interface AtomicFileMover {
+        void move(Path source, Path target) throws IOException;
     }
 
     private static final class InvalidProbeException extends RuntimeException {
@@ -543,8 +636,8 @@ public class FfmpegMediaService {
             if (sampleRate <= 0 || channels <= 0) {
                 throw new IllegalArgumentException("sampleRate and channels must be positive");
             }
-            if (atempo != null && (!Double.isFinite(atempo) || atempo <= 0)) {
-                throw new IllegalArgumentException("atempo must be positive when present");
+            if (atempo != null && (!Double.isFinite(atempo) || atempo < 0.5 || atempo > 2.0)) {
+                throw new IllegalArgumentException("atempo must be between 0.5 and 2.0 when present");
             }
         }
 

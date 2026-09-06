@@ -2,6 +2,7 @@ package com.audiobookfactory.control.library;
 
 import com.audiobookfactory.control.audio.FfmpegMediaService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -20,41 +21,64 @@ public class LibraryPublishService {
     private static final String ENV_LIBRARY_ROOT = "AUDIOBOOKSHELF_LIBRARY_ROOT";
     private static final String ENV_LIBRARY_PATH = "AUDIOBOOKSHELF_LIBRARY_PATH";
     private static final String ENV_LIBRARY_ID = "AUDIOBOOKSHELF_LIBRARY_ID";
+    private static final ChapterCompletionPort NOOP_COMPLETION = (chapterId, finalAudioPath) -> { };
 
     private final FfmpegMediaService mediaService;
     private final Path libraryRoot;
     private final Path sourceRoot;
     private final ScanInvoker scanInvoker;
     private final String libraryId;
+    private final ChapterCompletionPort completionPort;
 
     @Autowired
-    public LibraryPublishService(FfmpegMediaService mediaService, AudiobookshelfClient client) {
+    public LibraryPublishService(FfmpegMediaService mediaService, AudiobookshelfClient client,
+                                 @Lazy ChapterCompletionPort completionPort) {
         this(mediaService, libraryRootFromEnvironment(), sourceRootFromEnvironment(),
-                client::scan, System.getenv(ENV_LIBRARY_ID));
+                client::scan, System.getenv(ENV_LIBRARY_ID), completionPort);
     }
 
     public LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot,
                                  ScanInvoker scanInvoker) {
-        this(mediaService, libraryRoot, null, scanInvoker, null);
+        this(mediaService, libraryRoot, null, scanInvoker, null, NOOP_COMPLETION);
     }
 
     public LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot,
                                  AudiobookshelfClient client) {
-        this(mediaService, libraryRoot, null, client::scan, client.configuredLibraryId());
+        this(mediaService, libraryRoot, null, client::scan, client.configuredLibraryId(),
+                NOOP_COMPLETION);
     }
 
     public LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot,
                                  String libraryId, ScanInvoker scanInvoker) {
-        this(mediaService, libraryRoot, null, scanInvoker, libraryId);
+        this(mediaService, libraryRoot, null, scanInvoker, libraryId, NOOP_COMPLETION);
+    }
+
+    public LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot,
+                                 String libraryId, ScanInvoker scanInvoker,
+                                 ChapterCompletionPort completionPort) {
+        this(mediaService, libraryRoot, null, scanInvoker, libraryId, completionPort);
+    }
+
+    public LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot,
+                                 ScanInvoker scanInvoker, ChapterCompletionPort completionPort) {
+        this(mediaService, libraryRoot, null, scanInvoker, null, completionPort);
     }
 
     LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot, Path sourceRoot,
                           ScanInvoker scanInvoker, String libraryId) {
+        this(mediaService, libraryRoot, sourceRoot, scanInvoker, libraryId, NOOP_COMPLETION);
+    }
+
+    LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot, Path sourceRoot,
+                          ScanInvoker scanInvoker, String libraryId,
+                          ChapterCompletionPort completionPort) {
         this.mediaService = Objects.requireNonNull(mediaService, "mediaService must not be null");
         this.libraryRoot = normalizeRoot(libraryRoot, "libraryRoot");
         this.sourceRoot = sourceRoot == null ? null : normalizeRoot(sourceRoot, "sourceRoot");
         this.scanInvoker = Objects.requireNonNull(scanInvoker, "scanInvoker must not be null");
         this.libraryId = blankToNull(libraryId);
+        this.completionPort = Objects.requireNonNull(completionPort,
+                "completionPort must not be null");
     }
 
     public Path publishChapter(Chapter chapter, List<AudioAsset> assets) {
@@ -93,6 +117,14 @@ public class LibraryPublishService {
         } catch (RuntimeException exception) {
             throw new PublishException("AUDIOBOOKSHELF_SCAN_FAILED",
                     "Audiobookshelf scan failed", exception);
+        }
+        try {
+            completionPort.completeChapter(chapter.chapterId(), merged.toString());
+        } catch (PublishException exception) {
+            throw exception;
+        } catch (RuntimeException exception) {
+            throw new PublishException("CHAPTER_COMPLETION_FAILED",
+                    "Chapter completion failed", exception);
         }
         return merged;
     }
@@ -249,7 +281,7 @@ public class LibraryPublishService {
         void scan(String libraryId);
     }
 
-    public record Chapter(String bookTitle, int chapterNumber, String title) {
+    public record Chapter(long chapterId, String bookTitle, int chapterNumber, String title) {
 
         public Chapter {
             if (bookTitle == null || bookTitle.isBlank()) {
@@ -263,8 +295,16 @@ public class LibraryPublishService {
             }
         }
 
+        public Chapter(String bookTitle, int chapterNumber, String title) {
+            this(0, bookTitle, chapterNumber, title);
+        }
+
         public Chapter(int chapterNumber, String title, String bookTitle) {
-            this(bookTitle, chapterNumber, title);
+            this(0, bookTitle, chapterNumber, title);
+        }
+
+        public Chapter(long chapterId, int chapterNumber, String title, String bookTitle) {
+            this(chapterId, bookTitle, chapterNumber, title);
         }
     }
 

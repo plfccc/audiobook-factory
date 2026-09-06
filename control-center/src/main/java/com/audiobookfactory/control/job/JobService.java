@@ -1,7 +1,11 @@
 package com.audiobookfactory.control.job;
 
 import com.audiobookfactory.control.ApiException;
+import com.audiobookfactory.control.audio.AudioValidationResult;
+import com.audiobookfactory.control.audio.FfmpegMediaService;
 import com.audiobookfactory.control.config.AppProperties;
+import com.audiobookfactory.control.library.ChapterCompletionPort;
+import com.audiobookfactory.control.library.LibraryPublishService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -44,14 +48,17 @@ import java.util.Set;
 import java.util.UUID;
 
 @Service
-public class JobService {
+public class JobService implements ChapterCompletionPort {
 
     public static final String DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base";
     public static final int DEFAULT_LEASE_SECONDS = JobClaimRepository.LEASE_SECONDS;
 
     private static final long MAX_RESULT_BYTES = 512L * 1024 * 1024;
+    private static final String ENV_LIBRARY_ROOT = "AUDIOBOOKSHELF_LIBRARY_ROOT";
+    private static final String ENV_LIBRARY_PATH = "AUDIOBOOKSHELF_LIBRARY_PATH";
     private static final Set<String> RETRYABLE_FAILURE_CODES = Set.of(
-            "GENERATION_TIMEOUT", "DOWNLOAD_TIMEOUT", "PAGE_NOT_READY", "TEMPORARY_FAILURE");
+            "GENERATION_TIMEOUT", "DOWNLOAD_TIMEOUT", "PAGE_NOT_READY", "TEMPORARY_FAILURE",
+            "AUDIO_INVALID");
     private static final Set<String> CONTROL_PLANE_FAILURE_CODES = Set.of(
             "AUTH_REQUIRED", "QUOTA_PAUSED", "HUMAN_REQUIRED", "WAITING_FOR_GPU",
             "WORKER_UNAUTHORIZED");
@@ -110,25 +117,43 @@ public class JobService {
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
     private final Path storageRoot;
+    private final Path libraryRoot;
+    private final FfmpegMediaService mediaService;
+    private final LibraryPublishService libraryPublishService;
 
     @Autowired
     public JobService(JdbcTemplate jdbcTemplate,
                       PlatformTransactionManager transactionManager,
                       ObjectMapper objectMapper,
-                      AppProperties appProperties) {
-        this(jdbcTemplate, transactionManager, objectMapper, appProperties.storageRoot());
+                      AppProperties appProperties,
+                      FfmpegMediaService mediaService,
+                      LibraryPublishService libraryPublishService) {
+        this(jdbcTemplate, transactionManager, objectMapper, appProperties.storageRoot(),
+                mediaService, libraryPublishService);
     }
 
     public JobService(JdbcTemplate jdbcTemplate,
                       PlatformTransactionManager transactionManager,
                       ObjectMapper objectMapper,
                       Path storageRoot) {
+        this(jdbcTemplate, transactionManager, objectMapper, storageRoot, null, null);
+    }
+
+    public JobService(JdbcTemplate jdbcTemplate,
+                      PlatformTransactionManager transactionManager,
+                      ObjectMapper objectMapper,
+                      Path storageRoot,
+                      FfmpegMediaService mediaService,
+                      LibraryPublishService libraryPublishService) {
         this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
         this.transactionTemplate = new TransactionTemplate(
                 Objects.requireNonNull(transactionManager, "transactionManager must not be null"));
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
         this.storageRoot = Objects.requireNonNull(storageRoot, "storageRoot must not be null")
                 .toAbsolutePath().normalize();
+        this.libraryRoot = libraryRootFromEnvironment();
+        this.mediaService = mediaService;
+        this.libraryPublishService = libraryPublishService;
     }
 
     public JobBatch createPreview(long bookId, Map<String, Object> request) {
@@ -416,10 +441,20 @@ public class JobService {
         StagedResult staged = stageResult(audio);
         ResultTarget target = new ResultTarget();
         try {
+            verifyResultLease(jobId, owner);
             ParsedResultMetadata metadata = validateResultMetadata(
                     declaredMetadata, staged.sha256(), staged.sizeBytes());
-            transactionTemplate.executeWithoutResult(status ->
-                    persistResult(jobId, owner, staged.path(), metadata, target));
+            AudioValidationResult validation = validateUploadedAudio(staged);
+            if (!validation.valid()) {
+                markResultRetryable(jobId, owner, validation.errorCode());
+                throw invalidResult("Result audio is invalid");
+            }
+            JobRow job = transactionTemplate.execute(status ->
+                    persistResult(jobId, owner, staged.path(), metadata, validation, target));
+            if (job == null) {
+                throw new IllegalStateException("result transaction returned no job");
+            }
+            publishReadyChapter(job, owner);
         } finally {
             deleteQuietly(staged.path());
             if (target.moved() && !target.committed()) {
@@ -428,9 +463,14 @@ public class JobService {
         }
     }
 
+    @Override
+    public void completeChapter(long chapterId, String finalAudioPath) {
+        completeChapterAfterMerge(chapterId, finalAudioPath);
+    }
+
     public void completeChapterAfterMerge(long chapterId, String finalAudioPath) {
         requirePositiveId(chapterId, "chapterId");
-        Path finalPath = safeStoragePath(finalAudioPath);
+        Path finalPath = safeChapterAudioPath(finalAudioPath);
         if (!Files.isRegularFile(finalPath, LinkOption.NOFOLLOW_LINKS)) {
             throw new ApiException("CHAPTER_AUDIO_NOT_FOUND", 409, "Merged chapter audio is not ready");
         }
@@ -472,14 +512,183 @@ public class JobService {
         }
     }
 
-    private void persistResult(long jobId, String workerId, Path stagedPath,
-                               ParsedResultMetadata metadata, ResultTarget target) {
+    private void verifyResultLease(long jobId, String workerId) {
+        transactionTemplate.executeWithoutResult(status -> {
+            JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
+                    new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
+            if ("SUCCESS".equals(job.status())) {
+                ensureCompletedResultLease(job, workerId);
+            } else {
+                ensureCurrentLease(job, workerId);
+            }
+        });
+    }
+
+    private AudioValidationResult validateUploadedAudio(StagedResult staged) {
+        if (mediaService == null) {
+            throw new ApiException("MEDIA_VALIDATION_UNAVAILABLE", 503,
+                    "Audio validation is not configured");
+        }
+        AudioValidationResult validation;
+        try {
+            validation = mediaService.validate(staged.path());
+        } catch (RuntimeException exception) {
+            validation = AudioValidationResult.invalid(FfmpegMediaService.AUDIO_INVALID,
+                    "Audio validation failed");
+        }
+        if (validation == null || !validation.valid()
+                || validation.sizeBytes() != staged.sizeBytes()
+                || validation.sha256() == null
+                || !validation.sha256().equalsIgnoreCase(staged.sha256())) {
+            return AudioValidationResult.invalid(
+                    validation == null ? FfmpegMediaService.AUDIO_INVALID : validation.errorCode(),
+                    "Result audio is invalid");
+        }
+        return validation;
+    }
+
+    private void markResultRetryable(long jobId, String workerId, String errorCode) {
+        transactionTemplate.executeWithoutResult(status -> {
+            JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
+                    new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
+            if ("SUCCESS".equals(job.status())) {
+                ensureCompletedResultLease(job, workerId);
+                return;
+            }
+            ensureCurrentLease(job, workerId);
+            markJobWaiting(job.id(), job.chapterId(), retryableCode(errorCode), "Result audio is invalid");
+        });
+    }
+
+    private void publishReadyChapter(JobRow job, String workerId) {
+        if (libraryPublishService == null) {
+            return;
+        }
+        Optional<ChapterPublishData> ready = findReadyChapter(job.chapterId());
+        if (ready.isEmpty()) {
+            return;
+        }
+        try {
+            Path published = libraryPublishService.publishChapter(
+                    ready.get().chapter(), ready.get().assets());
+            if (published == null) {
+                throw new LibraryPublishService.PublishException(
+                        "CHAPTER_PUBLISH_FAILED", "Chapter publish returned no path");
+            }
+        } catch (RuntimeException exception) {
+            markPublishRetry(job.id(), workerId, publishFailureCode(exception));
+            throw publishFailure(exception);
+        }
+    }
+
+    private Optional<ChapterPublishData> findReadyChapter(long chapterId) {
+        List<ChapterPublishRow> chapters = jdbcTemplate.query("""
+                SELECT c.id AS chapter_id, c.chapter_number, c.title AS chapter_title,
+                       b.title AS book_title, c.status,
+                       COUNT(gj.id) AS total_jobs,
+                       COUNT(gj.id) FILTER (WHERE gj.status = 'SUCCESS') AS successful_jobs
+                FROM chapter c
+                JOIN book_version bv ON bv.id = c.book_version_id
+                JOIN book b ON b.id = bv.book_id
+                LEFT JOIN generation_job gj ON gj.chapter_id = c.id
+                WHERE c.id = ?
+                GROUP BY c.id, c.chapter_number, c.title, b.title, c.status
+                """, (resultSet, rowNum) -> new ChapterPublishRow(
+                resultSet.getLong("chapter_id"),
+                resultSet.getInt("chapter_number"),
+                resultSet.getString("chapter_title"),
+                resultSet.getString("book_title"),
+                resultSet.getString("status"),
+                resultSet.getLong("total_jobs"),
+                resultSet.getLong("successful_jobs")), chapterId);
+        if (chapters.isEmpty()) {
+            return Optional.empty();
+        }
+        ChapterPublishRow chapter = chapters.get(0);
+        if ("SUCCESS".equals(chapter.status()) || chapter.totalJobs() == 0
+                || chapter.totalJobs() != chapter.successfulJobs()) {
+            return Optional.empty();
+        }
+        List<LibraryPublishService.AudioAsset> assets = jdbcTemplate.query("""
+                SELECT gj.segment_index, aa.file_path
+                FROM generation_job gj
+                JOIN audio_asset aa ON aa.job_id = gj.id
+                WHERE gj.chapter_id = ? AND gj.status = 'SUCCESS'
+                ORDER BY gj.segment_index, gj.id
+                """, (resultSet, rowNum) -> new LibraryPublishService.AudioAsset(
+                resultSet.getInt("segment_index"), Path.of(resultSet.getString("file_path"))), chapterId);
+        if (assets.size() != chapter.totalJobs()) {
+            return Optional.empty();
+        }
+        return Optional.of(new ChapterPublishData(
+                new LibraryPublishService.Chapter(chapter.chapterId(), chapter.bookTitle(),
+                        chapter.chapterNumber(), chapter.chapterTitle()), assets));
+    }
+
+    private void markPublishRetry(long jobId, String workerId, String errorCode) {
+        transactionTemplate.executeWithoutResult(status -> {
+            JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
+                    new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
+            if ("SUCCESS".equals(job.status())) {
+                ensureCompletedResultLease(job, workerId);
+            } else {
+                ensureCurrentLease(job, workerId);
+            }
+            markJobWaiting(job.id(), job.chapterId(), retryableCode(errorCode),
+                    "Chapter publish is retryable");
+        });
+    }
+
+    private void markJobWaiting(long jobId, long chapterId, String errorCode, String errorMessage) {
+        Instant now = Instant.now();
+        jdbcTemplate.update("""
+                UPDATE generation_job
+                SET status = 'WAITING', lease_owner = NULL, lease_expires_at = NULL,
+                    heartbeat_at = NULL, error_code = ?, error_message = ?,
+                    next_retry_at = ?, finished_at = NULL, updated_at = ?
+                WHERE id = ?
+                """, errorCode, errorMessage, Timestamp.from(now.plusSeconds(retryDelaySeconds(1))),
+                Timestamp.from(now), jobId);
+        jdbcTemplate.update("""
+                UPDATE chapter
+                SET status = 'WAITING', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status <> 'SUCCESS'
+                """, chapterId);
+    }
+
+    private String publishFailureCode(RuntimeException exception) {
+        if (exception instanceof LibraryPublishService.PublishException publishException) {
+            return publishException.code();
+        }
+        if (exception instanceof FfmpegMediaService.MediaPipelineException mediaException) {
+            return mediaException.code();
+        }
+        return "TEMPORARY_FAILURE";
+    }
+
+    private ApiException publishFailure(RuntimeException exception) {
+        String code = publishFailureCode(exception);
+        return new ApiException(code, 503, "Chapter publish is not complete");
+    }
+
+    private String retryableCode(String code) {
+        return code != null && RETRYABLE_FAILURE_CODES.contains(code)
+                ? code : "TEMPORARY_FAILURE";
+    }
+
+    private ApiException invalidResult(String message) {
+        return new ApiException("INVALID_RESULT", 400, message);
+    }
+
+    private JobRow persistResult(long jobId, String workerId, Path stagedPath,
+                                 ParsedResultMetadata metadata, AudioValidationResult validation,
+                                 ResultTarget target) {
         JobRow job = findJobForUpdate(jobId).orElseThrow(() ->
                 new ApiException("JOB_NOT_FOUND", 404, "Job was not found"));
         if ("SUCCESS".equals(job.status())) {
             ensureCompletedResultLease(job, workerId);
             if (metadata.idempotencyKey().equals(job.resultIdempotencyKey())) {
-                return;
+                return job;
             }
             throw new ApiException("RESULT_IDEMPOTENCY_CONFLICT", 409,
                     "A different result was already recorded for this job");
@@ -488,8 +697,18 @@ public class JobService {
         Path finalPath = resultPath(job);
         try {
             Files.createDirectories(finalPath.getParent());
-            moveWithoutOverwrite(stagedPath, finalPath);
-            target.moved(finalPath);
+            if (Files.exists(finalPath, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(finalPath)
+                        || !Files.isRegularFile(finalPath, LinkOption.NOFOLLOW_LINKS)
+                        || Files.size(finalPath) != validation.sizeBytes()
+                        || !validation.sha256().equalsIgnoreCase(sha256(finalPath))) {
+                    throw new IOException("An existing result does not match the validated asset");
+                }
+                Files.deleteIfExists(stagedPath);
+            } else {
+                moveWithoutOverwrite(stagedPath, finalPath);
+                target.moved(finalPath);
+            }
         } catch (IOException exception) {
             throw new ApiException("RESULT_STORAGE_FAILED", 500, "Unable to store result audio");
         }
@@ -518,9 +737,17 @@ public class JobService {
                 INSERT INTO audio_asset (job_id, file_path, format, duration_ms, sample_rate,
                                          channels, size_bytes, sha256)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, jobId, finalPath.toString(), metadata.format(), metadata.durationMs(),
-                metadata.sampleRate(), metadata.channels(), metadata.actualSizeBytes(), metadata.actualSha256());
+                ON CONFLICT (job_id, file_path) DO UPDATE SET
+                    format = EXCLUDED.format,
+                    duration_ms = EXCLUDED.duration_ms,
+                    sample_rate = EXCLUDED.sample_rate,
+                    channels = EXCLUDED.channels,
+                    size_bytes = EXCLUDED.size_bytes,
+                    sha256 = EXCLUDED.sha256
+                """, jobId, finalPath.toString(), metadata.format(), validation.durationMs(),
+                validation.sampleRate(), validation.channels(), validation.sizeBytes(), validation.sha256());
         target.markCommitted();
+        return job;
     }
 
     private StagedResult stageResult(MultipartFile audio) {
@@ -1000,7 +1227,7 @@ public class JobService {
         return value.intValue();
     }
 
-    private Path safeStoragePath(String value) {
+    private Path safeChapterAudioPath(String value) {
         if (value == null || value.isBlank()) {
             throw new ApiException("INVALID_PATH", 400, "Storage path is invalid");
         }
@@ -1012,10 +1239,61 @@ public class JobService {
         }
         Path normalized = candidate.isAbsolute()
                 ? candidate.normalize() : storageRoot.resolve(candidate).normalize();
-        if (!normalized.startsWith(storageRoot)) {
+        if (!normalized.startsWith(storageRoot) && !normalized.startsWith(libraryRoot)) {
+            throw new ApiException("INVALID_PATH", 400, "Storage path is invalid");
+        }
+        if (containsSymbolicLink(normalized)) {
             throw new ApiException("INVALID_PATH", 400, "Storage path is invalid");
         }
         return normalized;
+    }
+
+    private String sha256(Path path) throws IOException {
+        MessageDigest digest = sha256Digest();
+        try (InputStream input = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
+            byte[] buffer = new byte[1024 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                if (read > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private boolean containsSymbolicLink(Path path) {
+        try {
+            Path absolute = path.toAbsolutePath().normalize();
+            Path current = absolute.getRoot();
+            if (current == null) {
+                return false;
+            }
+            for (Path component : absolute) {
+                current = current.resolve(component);
+                if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)
+                        && Files.isSymbolicLink(current)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (RuntimeException exception) {
+            return true;
+        }
+    }
+
+    private static Path libraryRootFromEnvironment() {
+        String configured = firstNonBlank(System.getenv(ENV_LIBRARY_ROOT),
+                System.getenv(ENV_LIBRARY_PATH));
+        return Path.of(configured == null ? "./library" : configured)
+                .toAbsolutePath().normalize();
+    }
+
+    private static String firstNonBlank(String first, String second) {
+        if (first != null && !first.isBlank()) {
+            return first.trim();
+        }
+        return second == null || second.isBlank() ? null : second.trim();
     }
 
     private static Instant timestamp(Timestamp value) {
@@ -1060,6 +1338,15 @@ public class JobService {
                           int segmentIndex, String errorCode, String errorMessage,
                           String resultIdempotencyKey, String bookStatus, String runId,
                           String batchId, String scopeId, String activeScopeId) {
+    }
+
+    private record ChapterPublishRow(long chapterId, int chapterNumber, String chapterTitle,
+                                     String bookTitle, String status, long totalJobs,
+                                     long successfulJobs) {
+    }
+
+    private record ChapterPublishData(LibraryPublishService.Chapter chapter,
+                                      List<LibraryPublishService.AudioAsset> assets) {
     }
 
     private record StagedResult(Path path, String sha256, long sizeBytes) {

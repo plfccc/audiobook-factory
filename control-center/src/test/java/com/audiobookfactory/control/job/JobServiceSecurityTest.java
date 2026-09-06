@@ -1,6 +1,8 @@
 package com.audiobookfactory.control.job;
 
 import com.audiobookfactory.control.ApiException;
+import com.audiobookfactory.control.audio.AudioValidationResult;
+import com.audiobookfactory.control.audio.FfmpegMediaService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -47,6 +49,9 @@ class JobServiceSecurityTest {
     @Mock
     TransactionStatus transactionStatus;
 
+    @Mock
+    FfmpegMediaService mediaService;
+
     private JobService service;
 
     @BeforeEach
@@ -54,11 +59,16 @@ class JobServiceSecurityTest {
         lenient().when(transactionManager.getTransaction(any(TransactionDefinition.class)))
                 .thenReturn(transactionStatus);
         lenient().when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
+        lenient().when(mediaService.validate(any(Path.class)))
+                .thenReturn(AudioValidationResult.valid(3, 1.25, "pcm_s16le", 24_000, 1,
+                        sha256("wav".getBytes(StandardCharsets.UTF_8))));
         service = new JobService(
                 jdbcTemplate,
                 transactionManager,
                 new ObjectMapper(),
-                Path.of("target", "job-service-security-test"));
+                Path.of("target", "job-service-security-test"),
+                mediaService,
+                null);
     }
 
     @Test

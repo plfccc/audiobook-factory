@@ -22,6 +22,12 @@ services:
     build:
       context: ../../control-center
       dockerfile: Dockerfile
+      network: host
+      args:
+        HTTP_PROXY: ${MVP_HTTP_PROXY:-}
+        HTTPS_PROXY: ${MVP_HTTPS_PROXY:-}
+        NO_PROXY: ${MVP_NO_PROXY:-}
+        MAVEN_OPTS: ${MVP_MAVEN_OPTS:-}
     environment:
       PORT: "8080"
       DB_URL: ${DB_URL:-jdbc:postgresql://postgres:5432/audiobook_factory}

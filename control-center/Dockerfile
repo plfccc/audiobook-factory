@@ -1,5 +1,15 @@
 FROM maven:3.9.9-eclipse-temurin-17 AS build
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG MAVEN_OPTS
+
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY} \
+    MAVEN_OPTS=${MAVEN_OPTS}
+
 WORKDIR /workspace
 COPY pom.xml ./
 RUN /usr/share/maven/bin/mvn -B -DskipTests dependency:go-offline
@@ -8,9 +18,13 @@ RUN /usr/share/maven/bin/mvn -B -DskipTests package
 
 FROM eclipse-temurin:17-jre-jammy
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get update \
+RUN HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" NO_PROXY="${NO_PROXY}" apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home --home-dir /home/audiobook \

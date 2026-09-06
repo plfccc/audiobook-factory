@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -24,8 +23,9 @@ class CandidateInferenceRequest:
     """传给 model-specific adapter 的完整请求快照。"""
 
     text: str
-    model_id: str
-    model_version: str
+    provider: str
+    model: str
+    version: str
     language: str
     voice: str
     style_prompt: str
@@ -34,6 +34,14 @@ class CandidateInferenceRequest:
     reference_text: str | None
     design_prompt: str | None
     destination: Path
+
+    @property
+    def model_id(self) -> str:
+        return self.model
+
+    @property
+    def model_version(self) -> str:
+        return self.version
 
 
 class CandidateAdapter(Protocol):
@@ -119,8 +127,9 @@ class LazyCandidateEngine:
         output.parent.mkdir(parents=True, exist_ok=True)
         request = CandidateInferenceRequest(
             text=job.text,
-            model_id=job.preset.model,
-            model_version=job.preset.model_version,
+            provider=job.preset.provider,
+            model=job.preset.model,
+            version=job.preset.model_version,
             language=job.preset.language,
             voice=job.preset.voice,
             style_prompt=job.preset.style_prompt,
@@ -130,17 +139,11 @@ class LazyCandidateEngine:
             design_prompt=prepared.design_prompt,
             destination=output,
         )
-        # The request object is the stable adapter contract. Keep the four-argument
-        # form temporarily usable for the existing offline/fake adapters.
-        synthesize = self._model_adapter.synthesize
-        if len(inspect.signature(synthesize).parameters) == 4:
-            generated = await asyncio.to_thread(
-                synthesize, model, job, prepared, output
-            )
-        else:
-            generated = await asyncio.to_thread(synthesize, model, request, output)
+        generated = await asyncio.to_thread(
+            self._model_adapter.synthesize, model, request, output
+        )
         output = Path(generated or output)
-        if not output.is_file() or output.stat().st_size == 0:
+        if output.is_symlink() or not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError(f"{self.__class__.__name__} did not produce WAV output")
         try:
             with wave.open(str(output), "rb") as audio:

@@ -6,9 +6,12 @@ from dataclasses import asdict, is_dataclass, replace
 from enum import StrEnum
 import hashlib
 import inspect
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Awaitable, Callable, Mapping
+import wave
 
 import httpx
 
@@ -65,6 +68,10 @@ class _TaskFailure(RuntimeError):
         self.code = code
 
 
+class ModelSelectionError(RuntimeError):
+    """显式模型选择不可用时的终止错误。"""
+
+
 class _OperationAborted(_TaskFailure):
     pass
 
@@ -86,6 +93,7 @@ class ColabWorker:
         runtime: RuntimeProbe | None = None,
         probe: RuntimeProbe | None = None,
         selected_model: ModelProfile | None = None,
+        requested_model_id: str | None = None,
         engine_factory: EngineFactory | None = None,
         cache_dir: Path | str = Path("/content/audiobook-cache"),
         heartbeat_interval_seconds: float = 30.0,
@@ -100,7 +108,20 @@ class ColabWorker:
         self.worker_name = worker_name
         self.registry = registry or ModelRegistry.default()
         self.runtime = runtime or probe
-        self.selected_model = selected_model
+        self.requested_model_id = requested_model_id
+        if requested_model_id is not None:
+            requested_profile = _profile_by_model_id(self.registry, requested_model_id)
+            if selected_model is not None and selected_model.model_id != requested_model_id:
+                raise ValueError(
+                    "selected_model and requested_model_id must identify the same model"
+                )
+            self.selected_model = requested_profile
+        else:
+            self.selected_model = selected_model
+        # `requested_model_id` is the user-visible hard selection.  A profile
+        # passed by the automatic selector remains provisional so the worker
+        # can downgrade to a compatible Qwen profile on a smaller GPU.
+        self._explicit_model_selection = self.requested_model_id is not None
         self.engine_factory = engine_factory or _default_engine_factory
         self.cache_dir = Path(cache_dir)
         self.heartbeat_interval_seconds = float(heartbeat_interval_seconds)
@@ -123,6 +144,9 @@ class ColabWorker:
     def from_environment(
         cls,
         settings: WorkerSettings | None = None,
+        *,
+        model_id: str | None = None,
+        candidate_model_id: str | None = None,
         **kwargs: Any,
     ) -> "ColabWorker":
         settings = settings or WorkerSettings()
@@ -138,10 +162,19 @@ class ColabWorker:
             write_timeout=settings.control_write_timeout_seconds,
             download_timeout=settings.download_timeout_seconds,
         )
+        requested_model_id = (
+            model_id
+            or candidate_model_id
+            or os.environ.get("CANDIDATE_MODEL_ID")
+            or None
+        )
+        options = dict(kwargs)
+        if requested_model_id is not None:
+            options["requested_model_id"] = requested_model_id
+        options.setdefault("cache_dir", settings.cache_dir)
         return cls(
             client,
             worker_name=settings.worker_name,
-            cache_dir=settings.cache_dir,
             heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
             claim_wait_seconds=settings.claim_wait_seconds,
             network_backoff_seconds=(
@@ -151,7 +184,7 @@ class ColabWorker:
             ),
             generation_timeout_seconds=settings.generation_timeout_seconds,
             download_timeout_seconds=settings.download_timeout_seconds,
-            **kwargs,
+            **options,
         )
 
     async def run_once(self) -> bool:
@@ -237,6 +270,14 @@ class ColabWorker:
             self.selected_model is not None
             and self.selected_model.minimum_vram_bytes > self.runtime.gpu_memory_bytes
         ):
+            if self._explicit_model_selection:
+                self._last_error = ModelSelectionError(
+                    f"selected model {self.selected_model.model_id} requires "
+                    f"{self.selected_model.minimum_vram_bytes} VRAM bytes, "
+                    f"but runtime provides {self.runtime.gpu_memory_bytes}"
+                )
+                self.state = WorkerState.FAILED
+                return False
             self.selected_model = None
         if self.selected_model is None:
             self.selected_model = GpuSelector.select(self.registry, self.runtime)
@@ -731,19 +772,63 @@ def _registration_capabilities(
 def _result_metadata(result: Any, destination: Path) -> tuple[dict[str, Any], Path]:
     if isinstance(result, GenerationResult):
         output_path = Path(result.output_path)
+        audio = _read_wav_metadata(output_path)
         metadata = {
             "sha256": result.sha256,
-            "sizeBytes": result.size_bytes,
-            "durationSeconds": result.duration_seconds,
-            "sampleRate": result.sample_rate,
-            "channels": result.channels,
+            **audio,
             "format": "wav",
         }
         return metadata, output_path
     output_path = Path(result) if isinstance(result, (Path, str)) else destination
-    if not output_path.is_file():
-        raise ValueError("TTS engine did not return a readable output path")
-    return {"sizeBytes": output_path.stat().st_size, "format": "wav"}, output_path
+    return {**_read_wav_metadata(output_path), "format": "wav"}, output_path
+
+
+def _read_wav_metadata(output_path: Path) -> dict[str, Any]:
+    if output_path.is_symlink():
+        raise _TaskFailure(
+            "INVALID_AUDIO_OUTPUT",
+            "generated audio must be a regular non-symlink WAV file",
+        )
+    try:
+        file_stat = output_path.stat()
+    except OSError as error:
+        raise _TaskFailure(
+            "INVALID_AUDIO_OUTPUT",
+            "generated audio path is not readable",
+        ) from error
+    if not stat.S_ISREG(file_stat.st_mode) or not output_path.is_file():
+        raise _TaskFailure(
+            "INVALID_AUDIO_OUTPUT",
+            "generated audio must be a regular WAV file",
+        )
+    if file_stat.st_size <= 0:
+        raise _TaskFailure(
+            "INVALID_AUDIO_OUTPUT",
+            "generated WAV must not be empty",
+        )
+    try:
+        with wave.open(str(output_path), "rb") as audio:
+            frames = audio.getnframes()
+            sample_rate = audio.getframerate()
+            channels = audio.getnchannels()
+            sample_width = audio.getsampwidth()
+            if frames <= 0 or sample_rate <= 0 or channels <= 0 or sample_width <= 0:
+                raise ValueError("invalid WAV metadata")
+            frame_data = audio.readframes(frames)
+            expected_size = frames * channels * sample_width
+            if len(frame_data) != expected_size:
+                raise ValueError("WAV frame data is truncated")
+    except (OSError, EOFError, wave.Error, ValueError) as error:
+        raise _TaskFailure(
+            "INVALID_AUDIO_OUTPUT",
+            "generated audio must be a readable WAV with valid frames, sample rate, and channels",
+        ) from error
+    return {
+        "sizeBytes": file_stat.st_size,
+        "durationSeconds": frames / sample_rate,
+        "sampleRate": sample_rate,
+        "channels": channels,
+    }
 
 
 def _validate_result_metadata(metadata: Mapping[str, Any], output_path: Path) -> None:
@@ -820,12 +905,22 @@ def _assert_path_inside(path: Path, root: Path, label: str) -> None:
 def _validate_output_path(path: Path, root: Path) -> Path:
     output_path = Path(path)
     _assert_path_inside(output_path, root, "output path")
-    if not output_path.is_file():
+    if output_path.is_symlink() or not output_path.is_file():
         raise _TaskFailure(
             "OUTPUT_PATH_INVALID",
-            "TTS engine did not return a readable output path",
+            "TTS engine must return a regular non-symlink output path",
         )
     return output_path
 
 
-__all__ = ["ColabWorker", "WorkerState"]
+def _profile_by_model_id(registry: ModelRegistry, model_id: str) -> ModelProfile:
+    for profile in registry.profiles:
+        if profile.model_id == model_id:
+            return profile
+    available = ", ".join(profile.model_id for profile in registry.profiles)
+    raise ValueError(
+        f"unknown model_id {model_id!r}; registered model IDs: {available}"
+    )
+
+
+__all__ = ["ColabWorker", "ModelSelectionError", "WorkerState"]

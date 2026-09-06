@@ -1,0 +1,9 @@
+# IndexTTS runtime code and libraries only; this file never downloads model weights.
+# Put config.yaml, matching checkpoint files, and local aux/ assets under
+# AUDIOBOOK_LOCAL_MODEL_ROOT/indextts-2.5. The aux/ directory must contain
+# w2v-bert-2.0/, semantic_codec_model.safetensors, campplus_cn_common.bin,
+# and bigvgan/.
+index-tts
+soundfile
+pyyaml
+transformers

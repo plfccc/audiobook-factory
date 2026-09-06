@@ -3,6 +3,7 @@ upload/
 data/
 runtime/
 logs/
+artifacts/
 .worktrees/
 *.wav
 *.mp3

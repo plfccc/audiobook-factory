@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 import hashlib
 from pathlib import Path
+import wave
 
 import pytest
 import httpx
@@ -24,6 +25,14 @@ from audiobook_worker.errors import ErrorCode, WorkerError
 
 def run_async(awaitable):
     return asyncio.run(awaitable)
+
+
+def write_valid_wav(path: Path, frames: int = 240) -> None:
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(24_000)
+        output.writeframes(b"\\x00\\x00" * frames)
 
 
 def make_job(tmp_path: Path) -> TtsJob:
@@ -105,12 +114,12 @@ class FakeEngine:
 
     async def synthesize(self, job, destination):
         self.synthesize_calls.append((job, Path(destination)))
-        Path(destination).write_bytes(b"wav")
+        write_valid_wav(Path(destination))
         return GenerationResult(
             request_id=job.job_id,
             output_path=Path(destination),
-            sha256=hashlib.sha256(b"wav").hexdigest(),
-            size_bytes=3,
+            sha256=hashlib.sha256(Path(destination).read_bytes()).hexdigest(),
+            size_bytes=Path(destination).stat().st_size,
             duration_seconds=1.0,
             sample_rate=24_000,
             channels=1,
@@ -152,7 +161,8 @@ def test_run_once_registers_prepares_generates_and_uploads(tmp_path):
     assert engine.prepare_calls[0].profile_id == "voice-1"
     assert engine.synthesize_calls[0][0].job_id == "job-1"
     assert client.upload_calls[0][0] == "job-1"
-    assert client.upload_calls[0][2]["sha256"] == hashlib.sha256(b"wav").hexdigest()
+    uploaded = client.upload_calls[0][1]
+    assert client.upload_calls[0][2]["sha256"] == hashlib.sha256(uploaded.read_bytes()).hexdigest()
     assert client.failure_calls == []
 
 
@@ -313,12 +323,12 @@ def test_generation_timeout_is_reported_and_not_uploaded(tmp_path):
 def test_invalid_generation_sha_is_rejected_before_upload(tmp_path):
     class InvalidShaEngine(FakeEngine):
         async def synthesize(self, job, destination):
-            Path(destination).write_bytes(b"wav")
+            write_valid_wav(Path(destination))
             return GenerationResult(
                 request_id=job.job_id,
                 output_path=Path(destination),
                 sha256="not-a-sha256",
-                size_bytes=3,
+                size_bytes=Path(destination).stat().st_size,
                 duration_seconds=1.0,
                 sample_rate=24_000,
                 channels=1,
@@ -336,6 +346,26 @@ def test_invalid_generation_sha_is_rejected_before_upload(tmp_path):
     assert run_async(worker.run_once()) is False
     assert client.upload_calls == []
     assert client.failure_calls[0][1] == "INVALID_RESULT_SHA256"
+
+
+def test_path_only_result_must_be_a_readable_wav(tmp_path):
+    class PathOnlyInvalidEngine(FakeEngine):
+        async def synthesize(self, job, destination):
+            Path(destination).write_bytes(b"not a wav")
+            return Path(destination)
+
+    client = FakeClient(make_job(tmp_path))
+    worker = ColabWorker(
+        client=client,
+        engine=PathOnlyInvalidEngine(),
+        runtime=make_probe(),
+        selected_model=make_profile(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert client.upload_calls == []
+    assert client.failure_calls[0][1] == "INVALID_AUDIO_OUTPUT"
 
 
 def test_provider_auth_failure_enters_waiting_state_instead_of_failed(tmp_path):
@@ -443,6 +473,24 @@ def test_run_once_enters_waiting_for_gpu_without_registering_or_claiming(tmp_pat
 
     assert run_async(worker.run_once()) is False
     assert worker.state is WorkerState.WAITING_FOR_GPU
+    assert client.register_calls == []
+    assert client.claim_calls == 0
+
+
+def test_explicit_model_id_fails_closed_when_gpu_is_too_small(tmp_path):
+    client = FakeClient(None)
+    worker = ColabWorker(
+        client=client,
+        engine=FakeEngine(),
+        runtime=RuntimeProbe(
+            True, "Small GPU", 4 * 1024**3, "12.4", "2.7.0", "3.11"
+        ),
+        requested_model_id="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert worker.state is WorkerState.FAILED
     assert client.register_calls == []
     assert client.claim_calls == 0
 

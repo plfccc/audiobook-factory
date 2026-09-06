@@ -1,0 +1,6 @@
+# CosyVoice runtime code and libraries only; this file never downloads model weights.
+# Put the matching model files under AUDIOBOOK_LOCAL_MODEL_ROOT/cosyvoice3.
+git+https://github.com/FunAudioLLM/CosyVoice.git@main
+soundfile
+pyyaml
+onnxruntime-gpu

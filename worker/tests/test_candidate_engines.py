@@ -201,6 +201,26 @@ def test_notebook_builder_check_and_secret_safety():
     assert "getpass" not in source.lower()
 
 
+def test_notebook_exposes_explicit_candidate_selection_and_benchmark_schema():
+    notebook = json.loads(
+        Path("notebooks/audiobook_factory_colab.ipynb").read_text(encoding="utf-8")
+    )
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+    assert "SELECTED_MODEL_ID" in source
+    assert "BENCHMARK_MODEL_IDS" in source
+    assert "select_candidate_profile" in source
+    assert "run_candidate_benchmark" in source
+    assert "LOCAL_MODEL_ROOT" in source
+    assert "requirements-colab.txt" in source
+    assert "requirements-cosyvoice.txt" in source
+    for field in (
+        '"engine"', '"model"', '"version"', '"sample"', '"language"',
+        '"category"', '"duration"', '"sampleRate"', '"channels"', '"size"',
+        '"elapsed"', '"rtf"', '"gpu"', '"vram"', '"startup"', '"failure"',
+    ):
+        assert field in source
+
+
 def test_offline_benchmark_runs_each_candidate_and_emits_metrics(tmp_path: Path):
     from audiobook_worker.benchmark import run_offline_benchmark
 

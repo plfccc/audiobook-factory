@@ -23,3 +23,9 @@ app:
   storage-root: ${STORAGE_ROOT:./data}
   worker-enroll-token: ${WORKER_ENROLL_TOKEN:}
   access-token: ${APP_ACCESS_TOKEN:}
+
+audiobookshelf:
+  base-url: ${AUDIOBOOKSHELF_BASE_URL:}
+  library-id: ${AUDIOBOOKSHELF_LIBRARY_ID:}
+  api-key: ${AUDIOBOOKSHELF_API_KEY:}
+  library-root: ${AUDIOBOOKSHELF_LIBRARY_ROOT:./library}

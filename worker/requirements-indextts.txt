@@ -3,7 +3,7 @@
 # AUDIOBOOK_LOCAL_MODEL_ROOT/indextts-2.5. The aux/ directory must contain
 # w2v-bert-2.0/, semantic_codec_model.safetensors, campplus_cn_common.bin,
 # and bigvgan/.
-index-tts
+git+https://github.com/index-tts/index-tts.git@v2.5.0
 soundfile
 pyyaml
 transformers

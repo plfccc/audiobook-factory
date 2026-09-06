@@ -1,7 +1,7 @@
 # F5-TTS runtime code and libraries only; this file never downloads model weights.
 # Put a local checkpoint and a local vocos/ vocoder directory under
 # AUDIOBOOK_LOCAL_MODEL_ROOT/f5-tts.
-f5-tts
+git+https://github.com/SWivid/F5-TTS.git@9c614e9657089213efc6a7421b30630be138a3f5
 soundfile
 pyyaml
 vocos

@@ -8,7 +8,6 @@ docker compose -f "${COMPOSE_FILE}" config --quiet
 services="$(docker compose -f "${COMPOSE_FILE}" config --services)"
 grep -qx "postgres" <<<"${services}"
 grep -qx "control-center" <<<"${services}"
-grep -qx "audiobookshelf" <<<"${services}"
 
 config="$(docker compose -f "${COMPOSE_FILE}" config)"
 grep -q "postgres:16" <<<"${config}"

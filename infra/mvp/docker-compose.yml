@@ -50,8 +50,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      audiobookshelf:
-        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "--silent", "--fail", "http://127.0.0.1:8080/actuator/health"]
       interval: 10s
@@ -61,6 +59,8 @@ services:
     restart: unless-stopped
 
   audiobookshelf:
+    profiles:
+      - audiobookshelf
     image: advplyr/audiobookshelf:2.21.0
     environment:
       TZ: Asia/Shanghai

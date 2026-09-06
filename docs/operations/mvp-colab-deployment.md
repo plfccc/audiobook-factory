@@ -50,7 +50,7 @@ CONTROL_CENTER_PORT=8080
 AUDIOBOOKSHELF_ENABLED=false
 ```
 
-还必须替换 `DB_PASSWORD`、`WORKER_ENROLL_TOKEN` 和 `APP_ACCESS_TOKEN`。`AUDIOBOOKSHELF_ENABLED=false` 时，空的 Audiobookshelf 配置不会阻止 Admin 启动；已合并的 MP3 仍会写入 `/data/library` 并可下载。
+还必须替换 `DB_PASSWORD`、`WORKER_ENROLL_TOKEN` 和 `APP_ACCESS_TOKEN`。`AUDIOBOOKSHELF_ENABLED=false` 时，空的 Audiobookshelf 配置不会阻止 Admin 启动；已合并的 MP3 仍会写入 `/data/library` 并可下载。Compose 默认也不会启动 Audiobookshelf profile。
 
 启动和检查：
 
@@ -97,6 +97,12 @@ AUDIOBOOKSHELF_ENABLED=true
 AUDIOBOOKSHELF_BASE_URL=http://audiobookshelf:80
 AUDIOBOOKSHELF_LIBRARY_ID=<library-id>
 AUDIOBOOKSHELF_API_KEY=<api-key>
+```
+
+启用 profile 并启动：
+
+```bash
+docker compose --env-file infra/mvp/.env -f infra/mvp/docker-compose.yml --profile audiobookshelf up -d
 ```
 
 即使启用，也不需要给 Audiobookshelf 发布公网端口；后续 Android App 应通过单独的受保护 API 或服务端适配层接入。

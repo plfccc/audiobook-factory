@@ -190,9 +190,9 @@ class _IndexTtsModelApi:
 class _IndexTtsAdapter:
     def synthesize(self, model: Any, request: CandidateInferenceRequest, destination: Path) -> Path:
         kwargs = _request_kwargs(request, destination)
-        api = getattr(model, "synthesize", None) or getattr(model, "infer", None)
+        api = getattr(model, "synthesize", None)
         if not callable(api):
-            raise RuntimeError("indextts model has no supported inference API")
+            raise RuntimeError("indextts loader must return its model-specific API wrapper")
         result = api(**kwargs)
         return Path(result) if isinstance(result, (Path, str)) else destination
 

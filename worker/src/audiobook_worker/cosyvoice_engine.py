@@ -129,11 +129,7 @@ class _CosyVoiceAdapter:
         kwargs = _request_kwargs(request, destination)
         api = getattr(model, "synthesize", None)
         if not callable(api):
-            api = getattr(model, "inference_sft", None) or getattr(
-                model, "inference_zero_shot", None
-            )
-        if not callable(api):
-            raise RuntimeError("cosyvoice model has no supported inference API")
+            raise RuntimeError("cosyvoice loader must return its model-specific API wrapper")
         result = api(**kwargs)
         if isinstance(result, (Path, str)):
             return Path(result)

@@ -31,9 +31,8 @@ RUN mkdir -p /root/.m2 \
       else \
         printf '%s\n' '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"></settings>' > /root/.m2/settings.xml; \
       fi
-RUN /usr/share/maven/bin/mvn -s /root/.m2/settings.xml -B -DskipTests dependency:go-offline
 COPY src ./src
-RUN /usr/share/maven/bin/mvn -s /root/.m2/settings.xml -B -DskipTests package
+RUN /usr/share/maven/bin/mvn -s /root/.m2/settings.xml -B -Dmaven.test.skip=true package
 
 FROM eclipse-temurin:17-jre-jammy
 
@@ -43,8 +42,14 @@ ARG NO_PROXY
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" NO_PROXY="${NO_PROXY}" apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl \
+RUN sed -i \
+        -e 's|archive.ubuntu.com/ubuntu|mirrors.aliyun.com/ubuntu|g' \
+        -e 's|security.ubuntu.com/ubuntu|mirrors.aliyun.com/ubuntu|g' \
+        /etc/apt/sources.list \
+    && HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" NO_PROXY="${NO_PROXY}" \
+        apt-get -o Acquire::Retries=5 update \
+    && HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" NO_PROXY="${NO_PROXY}" \
+        apt-get -o Acquire::Retries=5 install -y --no-install-recommends ffmpeg curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home --home-dir /home/audiobook \
         --shell /usr/sbin/nologin audiobook

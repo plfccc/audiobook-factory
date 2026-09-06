@@ -38,7 +38,9 @@ class BookServiceSecurityTest {
         when(row.getString("status")).thenReturn("FAILED");
         when(row.getString("error_code")).thenReturn("SECRET_CODE");
         when(row.getString("error_message")).thenReturn(
-                "token=worker-secret prompt=private prompt\nTraceback: java.lang.Error");
+                "You are a helpful assistant. Read this sentence aloud.\n"
+                        + "at com.example.worker.Worker.run(Worker.java:42)\n"
+                        + "C:\\service\\worker\\logs\\worker.log");
         doAnswer(invocation -> {
             RowMapper<?> mapper = invocation.getArgument(1);
             return List.of(mapper.mapRow(row, 1));
@@ -51,6 +53,6 @@ class BookServiceSecurityTest {
         assertThat(segments.get(0).errorCode()).isEqualTo("UNKNOWN_FAILURE");
         assertThat(segments.get(0).errorMessage()).isEqualTo("Worker reported a failure");
         assertThat(segments.get(0).errorMessage())
-                .doesNotContain("worker-secret", "private prompt", "Traceback");
+                .doesNotContain("helpful assistant", "Worker.java", "C:\\service");
     }
 }

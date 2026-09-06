@@ -467,6 +467,9 @@ class EpubImportServiceTest {
         assertThat(repository.jobs()).allSatisfy(job -> {
             assertThat(job.status()).isEqualTo("PENDING");
             assertThat(job.presetSnapshot()).isEqualTo("{}");
+            assertThat(job.runId()).isNotBlank();
+            assertThat(job.batchId()).isNotBlank();
+            assertThat(job.scopeId()).isNotBlank();
         });
     }
 
@@ -874,7 +877,16 @@ class EpubImportServiceTest {
         @Override
         public void createGenerationJob(long chapterId, int segmentIndex, String segmentText,
                                         String textSha256, String presetSnapshot) {
-            jobs.add(new JobRow(chapterId, segmentIndex, segmentText, textSha256, presetSnapshot, "PENDING"));
+            jobs.add(new JobRow(chapterId, segmentIndex, segmentText, textSha256, presetSnapshot,
+                    "PENDING", null, null, null));
+        }
+
+        @Override
+        public void createGenerationJob(long chapterId, int segmentIndex, String segmentText,
+                                        String textSha256, String presetSnapshot,
+                                        String runId, String batchId, String scopeId) {
+            jobs.add(new JobRow(chapterId, segmentIndex, segmentText, textSha256, presetSnapshot,
+                    "PENDING", runId, batchId, scopeId));
         }
 
         void simulateUniqueConflict(EpubImportService.StoredBookVersion winner) {
@@ -925,7 +937,8 @@ class EpubImportServiceTest {
         }
 
         private record JobRow(long chapterId, int segmentIndex, String segmentText, String textSha256,
-                              String presetSnapshot, String status) {
+                              String presetSnapshot, String status, String runId, String batchId,
+                              String scopeId) {
         }
     }
 }

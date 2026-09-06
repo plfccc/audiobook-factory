@@ -36,7 +36,8 @@ public class WorkerController {
 
     private static final String BEARER_PREFIX = "Bearer ";
     private static final Set<String> SENSITIVE_KEYS = Set.of(
-            "cloneprompt", "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
+            "cloneprompt", "secret", "token", "password", "apikey",
+            "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
 
     private final WorkerService workerService;
     private final ObjectMapper objectMapper;
@@ -60,8 +61,11 @@ public class WorkerController {
 
     @PostMapping("/workers/claim")
     public ResponseEntity<Map<String, Object>> claim(
-            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
-        JobClaim claim = workerService.claim(bearerToken(authorization));
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @RequestParam(value = "scopeId", required = false) String scopeId) {
+        String token = bearerToken(authorization);
+        JobClaim claim = scopeId == null
+                ? workerService.claim(token) : workerService.claim(token, scopeId);
         if (claim == null) {
             return ResponseEntity.noContent().build();
         }
@@ -126,6 +130,15 @@ public class WorkerController {
         body.put("leaseOwner", claim.leaseOwner());
         body.put("leaseUntil", claim.leaseUntil());
         body.put("leaseSeconds", WorkerService.LEASE_SECONDS);
+        if (claim.runId() != null) {
+            body.put("runId", claim.runId());
+        }
+        if (claim.batchId() != null) {
+            body.put("batchId", claim.batchId());
+        }
+        if (claim.scopeId() != null) {
+            body.put("scopeId", claim.scopeId());
+        }
         return body;
     }
 

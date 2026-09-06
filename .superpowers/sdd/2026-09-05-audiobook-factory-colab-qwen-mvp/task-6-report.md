@@ -35,3 +35,11 @@
 - 编译：HST `mvn-auto.cmd -f control-center/pom.xml -q -DskipTests compile` 成功。
 - 差异检查：`git diff --check` 与 staged diff check 均通过。
 - 限制：未执行真实 PostgreSQL claim 事务验证，需在 Docker/Testcontainers 可用环境中补充确认。
+
+## 本轮收敛：scope / preset sanitizer / claim（2026-09-06）
+
+- 相关实现与回归测试 patch-id：`fc5f300814d4bc46e67dcea61491746a302dd332`。
+- Preset 快照和 Worker claim 均通过递归 sanitizer 按归一化键拒绝 `secret`、`token`、`password`、`apiKey`、`accessToken`、`enrollmentToken`、`clone_prompt`，保留非敏感模型参数字段。
+- 保留并收敛已有 scope/claim 链路：scope 元数据落库、claim 过滤、Worker 返回字段及 migration；已有 FailureSanitizer 改动和安全测试一并保留，本轮未新增其行为。
+- 验证：HST `mvn-auto.cmd -f control-center/pom.xml -q -DskipTests compile` 成功；目标 Java 测试 68 个，`Failures 0`、`Errors 0`、`Skipped 1`；`git diff --check` 通过。
+- 限制：Docker/Testcontainers 未等待或启动，因此未执行真实 PostgreSQL/Flyway/并发 claim 事务验证。

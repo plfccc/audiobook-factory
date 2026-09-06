@@ -209,6 +209,34 @@ class JobServiceSecurityTest {
         assertThat(persisted.length()).isLessThanOrEqualTo(240);
     }
 
+    @Test
+    void statusUpdateRejectsALeaseFromAnInactiveScope() throws Exception {
+        stubRows(new JobData(1, "LEASED", "worker-1", futureLease(), 2, 1, 3, 4,
+                null, null, null, "RUNNING", "scope-a", "scope-b"));
+
+        assertThatThrownBy(() -> service.heartbeat(1, "worker-1"))
+                .isInstanceOfSatisfying(ApiException.class,
+                        exception -> assertThat(exception.code()).isEqualTo("LEASE_LOST"));
+    }
+
+    @Test
+    void workerPresetRemovesCredentialFieldsFromNestedSnapshots() {
+        String snapshot = """
+                {"provider":"qwen3-tts","clone_prompt":"keep-filtered",
+                 "secret":"secret-value","token":"token-value","password":"password-value",
+                 "apiKey":"api-key-value","accessToken":"access-token-value",
+                 "enrollmentToken":"enrollment-token-value","nested":{"secret":"nested-secret"}}
+                """;
+
+        String sanitized = service.workerPreset(snapshot).toString();
+
+        assertThat(sanitized)
+                .doesNotContain("clone_prompt", "secret-value", "token-value", "password-value",
+                        "api-key-value", "accessToken", "access-token-value",
+                        "enrollmentToken", "enrollment-token-value", "nested-secret")
+                .contains("qwen3-tts");
+    }
+
     private void stubRows(JobData data) throws java.sql.SQLException {
         ResultSet jobRow = org.mockito.Mockito.mock(ResultSet.class);
         lenient().when(jobRow.getLong(anyString())).thenAnswer(invocation -> switch (invocation.getArgument(0, String.class)) {
@@ -230,6 +258,8 @@ class JobServiceSecurityTest {
             case "error_message" -> data.errorMessage();
             case "result_idempotency_key" -> data.resultIdempotencyKey();
             case "book_status" -> data.bookStatus();
+            case "scope_id" -> data.scopeId();
+            case "active_scope_id" -> data.activeScopeId();
             default -> null;
         });
         lenient().when(jobRow.getTimestamp(anyString())).thenAnswer(invocation ->
@@ -273,6 +303,15 @@ class JobServiceSecurityTest {
     private record JobData(long id, String status, String leaseOwner, Instant leaseExpiresAt,
                            long chapterId, int chapterNumber, long bookId, long bookVersionId,
                            String errorCode, String errorMessage, String resultIdempotencyKey,
-                           String bookStatus) {
+                           String bookStatus, String scopeId, String activeScopeId) {
+
+        private JobData(long id, String status, String leaseOwner, Instant leaseExpiresAt,
+                        long chapterId, int chapterNumber, long bookId, long bookVersionId,
+                        String errorCode, String errorMessage, String resultIdempotencyKey,
+                        String bookStatus) {
+            this(id, status, leaseOwner, leaseExpiresAt, chapterId, chapterNumber, bookId,
+                    bookVersionId, errorCode, errorMessage, resultIdempotencyKey, bookStatus,
+                    null, null);
+        }
     }
 }

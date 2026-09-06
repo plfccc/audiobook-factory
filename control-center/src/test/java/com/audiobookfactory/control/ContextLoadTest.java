@@ -74,7 +74,7 @@ class ContextLoadTest {
 
         assertThat(columnsFor("book"))
                 .containsExactlyInAnyOrder("id", "title", "author", "cover_path", "status",
-                        "created_at", "updated_at");
+                        "active_scope_id", "created_at", "updated_at");
         assertThat(columnsFor("book_version"))
                 .containsExactlyInAnyOrder("id", "book_id", "source_file_path", "source_file_sha256",
                         "parser_version", "segmentation_rule_version", "created_at");
@@ -89,7 +89,8 @@ class ContextLoadTest {
                         "speed", "model_parameters", "segment_length", "created_at", "updated_at");
         assertThat(columnsFor("generation_job"))
                 .containsExactlyInAnyOrder("id", "chapter_id", "segment_index", "segment_text", "text_sha256",
-                        "preset_snapshot", "status", "lease_owner", "lease_expires_at", "error_code",
+                        "preset_snapshot", "run_id", "batch_id", "scope_id", "status", "lease_owner",
+                        "lease_expires_at", "error_code",
                         "error_message", "heartbeat_at", "attempts", "next_retry_at", "started_at",
                         "finished_at", "result_idempotency_key", "created_at", "updated_at");
         assertThat(columnsFor("audio_asset"))
@@ -113,6 +114,7 @@ class ContextLoadTest {
                 "idx_generation_job_status_lease",
                 "idx_generation_job_chapter_id",
                 "idx_generation_job_claim",
+                "idx_generation_job_scope_claim",
                 "idx_audio_asset_job_id",
                 "idx_worker_registration_status");
 
@@ -126,6 +128,8 @@ class ContextLoadTest {
         assertThat(indexDefinitions.get("idx_generation_job_chapter_id")).contains("(chapter_id)");
         assertThat(indexDefinitions.get("idx_generation_job_claim"))
                 .contains("(status, next_retry_at, chapter_id, segment_index)");
+        assertThat(indexDefinitions.get("idx_generation_job_scope_claim"))
+                .contains("(scope_id, status, next_retry_at, chapter_id, segment_index)");
         assertThat(indexDefinitions.get("idx_audio_asset_job_id")).contains("(job_id)");
         assertThat(indexDefinitions.get("idx_worker_registration_status")).contains("(status)");
     }

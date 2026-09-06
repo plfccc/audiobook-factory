@@ -15,7 +15,13 @@ public final class FailureSanitizer {
             "DOWNLOAD_TIMEOUT", "AUDIO_INVALID", "PERMANENT_FAILED", "TEMPORARY_FAILURE",
             "MODEL_NOT_COMPATIBLE", "INVALID_JOB_ID", "INVALID_ASSET_SHA256",
             "INVALID_RESULT_SHA256", "OUTPUT_PATH_INVALID", "WORKER_DISABLED", "REVOKED",
-            "WORKER_STOPPED", "WORKER_STOPPING", "STOPPED");
+            "WORKER_STOPPED", "WORKER_STOPPING", "STOPPED", "UNKNOWN_FAILURE");
+    private static final Set<String> SAFE_SUMMARIES = Set.of(
+            "audio invalid", "bad audio", "result audio is invalid", "sign in required",
+            "quota paused", "waiting for gpu", "worker authorization is required",
+            "worker lease is no longer valid", "page not ready", "generation timeout",
+            "download timeout", "temporary failure", "model not compatible",
+            "output path invalid", "asset not found", GENERIC_SUMMARY.toLowerCase(Locale.ROOT));
 
     private FailureSanitizer() {
     }
@@ -42,19 +48,11 @@ public final class FailureSanitizer {
         if (normalized.isEmpty()) {
             return null;
         }
-        String key = normalizeKey(normalized);
-        if (normalized.chars().anyMatch(Character::isISOControl)
-                || key.contains("token") || key.contains("secret") || key.contains("password")
-                || key.contains("prompt") || key.contains("traceback") || key.contains("stacktrace")
-                || key.contains("exception") || key.contains("authorization")
-                || key.contains("cookie") || key.contains("apikey") || key.contains("privatekey")) {
+        if (normalized.length() > MAX_SUMMARY_LENGTH
+                || normalized.chars().anyMatch(Character::isISOControl)) {
             return GENERIC_SUMMARY;
         }
-        return normalized.length() > MAX_SUMMARY_LENGTH
-                ? normalized.substring(0, MAX_SUMMARY_LENGTH) : normalized;
-    }
-
-    private static String normalizeKey(String value) {
-        return value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+        return SAFE_SUMMARIES.contains(normalized.toLowerCase(Locale.ROOT))
+                ? normalized : GENERIC_SUMMARY;
     }
 }

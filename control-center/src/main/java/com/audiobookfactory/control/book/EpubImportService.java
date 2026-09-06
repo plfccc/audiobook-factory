@@ -234,6 +234,9 @@ public class EpubImportService {
                     segmentationPolicy.rulesVersion(),
                     chapters.size());
             workspace.recordBookVersion(bookId, bookVersionId);
+            String runId = "run-" + UUID.randomUUID();
+            String batchId = "batch-" + UUID.randomUUID();
+            String scopeId = "scope-" + UUID.randomUUID();
             for (int chapterOffset = 0; chapterOffset < chapters.size(); chapterOffset++) {
                 ChapterDraft chapter = chapters.get(chapterOffset);
                 int chapterNumber = chapterOffset + 1;
@@ -251,7 +254,10 @@ public class EpubImportService {
                             segment.index(),
                             segment.text(),
                             segment.textSha256(),
-                            PRESET_SNAPSHOT);
+                            PRESET_SNAPSHOT,
+                            runId,
+                            batchId,
+                            scopeId);
                 }
             }
             return new BookImportResult(bookId, bookVersionId, chapters.size(), staged.sha256());
@@ -335,6 +341,12 @@ public class EpubImportService {
         default void createGenerationJob(long chapterId, int segmentIndex, String segmentText,
                                          String textSha256, String presetSnapshot) {
             createGenerationJob(chapterId, segmentIndex, segmentText, textSha256);
+        }
+
+        default void createGenerationJob(long chapterId, int segmentIndex, String segmentText,
+                                         String textSha256, String presetSnapshot,
+                                         String runId, String batchId, String scopeId) {
+            createGenerationJob(chapterId, segmentIndex, segmentText, textSha256, presetSnapshot);
         }
     }
 
@@ -1502,6 +1514,18 @@ public class EpubImportService {
                     "INSERT INTO generation_job (chapter_id, segment_index, segment_text, text_sha256, preset_snapshot) "
                             + "VALUES (?, ?, ?, ?, CAST(? AS jsonb))",
                     chapterId, segmentIndex, segmentText, textSha256, presetSnapshot);
+        }
+
+        @Override
+        public void createGenerationJob(long chapterId, int segmentIndex, String segmentText,
+                                        String textSha256, String presetSnapshot,
+                                        String runId, String batchId, String scopeId) {
+            jdbcTemplate.update(
+                    "INSERT INTO generation_job (chapter_id, segment_index, segment_text, text_sha256, "
+                            + "preset_snapshot, run_id, batch_id, scope_id) "
+                            + "VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?)",
+                    chapterId, segmentIndex, segmentText, textSha256, presetSnapshot,
+                    runId, batchId, scopeId);
         }
 
         private long insert(String sql, Object... arguments) {

@@ -18,6 +18,7 @@ import java.util.Map;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -71,7 +72,11 @@ class WorkerHttpContractTest {
     @Test
     void claimUsesTask5FieldNamesAndDoesNotExposeClonePrompt() throws Exception {
         JobClaim claim = new JobClaim(11, 7, 8, 9, 1, 1, "测试。",
-                "{\"provider\":\"qwen3-tts\",\"clone_prompt\":\"secret\"}",
+                "{\"provider\":\"qwen3-tts\",\"clone_prompt\":\"secret\","
+                        + "\"secret\":\"secret-value\",\"token\":\"token-value\","
+                        + "\"password\":\"password-value\",\"apiKey\":\"api-key-value\","
+                        + "\"accessToken\":\"access-token-value\","
+                        + "\"enrollmentToken\":\"enrollment-token-value\"}",
                 "worker-1", Instant.parse("2026-09-05T00:05:00Z"), 1);
         when(workerService.claim("worker-token")).thenReturn(claim);
 
@@ -85,7 +90,39 @@ class WorkerHttpContractTest {
                 .andExpect(content().string(org.hamcrest.Matchers.not(
                         org.hamcrest.Matchers.containsString("clone_prompt"))))
                 .andExpect(content().string(org.hamcrest.Matchers.not(
-                        org.hamcrest.Matchers.containsString("secret"))));
+                        org.hamcrest.Matchers.containsString("secret"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("token-value"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("password-value"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("api-key-value"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("accessToken"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("access-token-value"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("enrollmentToken"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("enrollment-token-value"))));
+    }
+
+    @Test
+    void scopedClaimIsOptionalAndForwardedWithoutChangingTheTask5Route() throws Exception {
+        JobClaim claim = new JobClaim(11, 7, 8, 9, 1, 1, "测试。", "{}",
+                "worker-1", Instant.parse("2026-09-05T00:05:00Z"), 1,
+                "run-a", "batch-a", "scope-a");
+        when(workerService.claim("worker-token", "scope-a")).thenReturn(claim);
+
+        mockMvc.perform(post("/api/v1/workers/claim")
+                        .header("Authorization", "Bearer worker-token")
+                        .param("scopeId", "scope-a"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.runId").value("run-a"))
+                .andExpect(jsonPath("$.batchId").value("batch-a"))
+                .andExpect(jsonPath("$.scopeId").value("scope-a"));
+
+        verify(workerService).claim("worker-token", "scope-a");
     }
 
     @Test

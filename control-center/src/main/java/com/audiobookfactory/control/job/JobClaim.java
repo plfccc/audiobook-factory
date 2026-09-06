@@ -13,7 +13,17 @@ public record JobClaim(
         String presetSnapshot,
         String leaseOwner,
         Instant leaseUntil,
-        int attempts) {
+        int attempts,
+        String runId,
+        String batchId,
+        String scopeId) {
+
+    public JobClaim(long jobId, long bookId, long bookVersionId, long chapterId,
+                    int chapterIndex, int segmentIndex, String text, String presetSnapshot,
+                    String leaseOwner, Instant leaseUntil, int attempts) {
+        this(jobId, bookId, bookVersionId, chapterId, chapterIndex, segmentIndex, text,
+                presetSnapshot, leaseOwner, leaseUntil, attempts, null, null, null);
+    }
 
     public JobClaim {
         if (jobId <= 0 || bookId <= 0 || bookVersionId <= 0 || chapterId <= 0) {
@@ -33,6 +43,9 @@ public record JobClaim(
         }
         if (attempts <= 0) {
             throw new IllegalArgumentException("attempts must be positive");
+        }
+        if (scopeId != null && scopeId.isBlank()) {
+            throw new IllegalArgumentException("scopeId must not be blank");
         }
     }
 }

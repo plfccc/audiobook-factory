@@ -134,6 +134,43 @@ class JobClaimRepositoryTest {
         assertThat(claim.chapterIndex()).isEqualTo(1);
     }
 
+    @Test
+    void explicitScopeCannotClaimAnotherWaitingScopeFromTheSameBook() {
+        insertBookWithJobs("RUNNING", List.of(1), List.of(1));
+        jdbcTemplate.update("UPDATE generation_job SET scope_id=? WHERE id=1", "scope-a");
+        jdbcTemplate.update("UPDATE generation_job SET scope_id=? WHERE id=2", "scope-b");
+        jdbcTemplate.update("UPDATE book SET active_scope_id=? WHERE id=1", "scope-a");
+
+        JobClaim claim = repository.claimNext(
+                "worker-a", Instant.parse("2026-09-05T00:00:00Z"), "scope-a");
+
+        assertThat(claim).isNotNull();
+        assertThat(claim.jobId()).isEqualTo(1L);
+        assertThat(claim.scopeId()).isEqualTo("scope-a");
+        assertThat(repository.claimNext(
+                "worker-a", Instant.parse("2026-09-05T00:00:01Z"), "scope-a")).isNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM generation_job WHERE id=2", String.class)).isEqualTo("WAITING");
+    }
+
+    @Test
+    void legacyClaimProtocolStaysWithinTheBookCurrentScope() {
+        insertBookWithJobs("RUNNING", List.of(1), List.of(1));
+        jdbcTemplate.update("UPDATE generation_job SET scope_id=? WHERE id=1", "scope-a");
+        jdbcTemplate.update("UPDATE generation_job SET scope_id=? WHERE id=2", "scope-b");
+        jdbcTemplate.update("UPDATE book SET active_scope_id=? WHERE id=1", "scope-a");
+
+        JobClaim claim = repository.claimNext(
+                "worker-a", Instant.parse("2026-09-05T00:00:00Z"));
+
+        assertThat(claim).isNotNull();
+        assertThat(claim.scopeId()).isEqualTo("scope-a");
+        assertThat(repository.claimNext(
+                "worker-a", Instant.parse("2026-09-05T00:00:01Z"))).isNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM generation_job WHERE id=2", String.class)).isEqualTo("WAITING");
+    }
+
     private void insertBookWithJobs(String bookStatus, List<Integer> firstChapterSegments,
                                     List<Integer> laterChapterSegments) {
         jdbcTemplate.update("INSERT INTO book (title, status) VALUES ('Test', ?)", bookStatus);

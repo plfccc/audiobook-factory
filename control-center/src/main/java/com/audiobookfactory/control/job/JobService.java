@@ -56,7 +56,9 @@ public class JobService {
             "AUTH_REQUIRED", "QUOTA_PAUSED", "HUMAN_REQUIRED", "WAITING_FOR_GPU",
             "WORKER_UNAUTHORIZED");
     private static final Set<String> SENSITIVE_PRESET_KEYS = Set.of(
-            "cloneprompt", "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
+            "cloneprompt", "secret", "token", "password", "apikey",
+            "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
+    private static final Set<String> SCOPE_METADATA_KEYS = Set.of("runid", "batchid", "scopeid");
     private static final Set<String> LEASED_STATUSES = Set.of("LEASED", "GENERATING", "UPLOADING");
     private static final List<TtsModelView> TTS_MODELS = List.of(
             new TtsModelView(
@@ -83,7 +85,8 @@ public class JobService {
                     new TtsCapabilities(List.of("zh-CN", "en-US"), false, true, false, false),
                     "https://github.com/SWivid/F5-TTS/blob/main/LICENSE"));
     private static final RowMapper<BookRow> BOOK_ROW_MAPPER = (resultSet, rowNum) -> new BookRow(
-            resultSet.getLong("id"), resultSet.getString("status"));
+            resultSet.getLong("id"), resultSet.getString("status"),
+            resultSet.getString("active_scope_id"));
     private static final RowMapper<JobRow> JOB_ROW_MAPPER = (resultSet, rowNum) -> new JobRow(
             resultSet.getLong("id"),
             resultSet.getString("status"),
@@ -97,7 +100,11 @@ public class JobService {
             resultSet.getString("error_code"),
             resultSet.getString("error_message"),
             resultSet.getString("result_idempotency_key"),
-            resultSet.getString("book_status"));
+            resultSet.getString("book_status"),
+            resultSet.getString("run_id"),
+            resultSet.getString("batch_id"),
+            resultSet.getString("scope_id"),
+            resultSet.getString("active_scope_id"));
 
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
@@ -186,6 +193,7 @@ public class JobService {
         if (start <= 0 || end < start) {
             throw new ApiException("INVALID_CHAPTER_RANGE", 400, "Chapter range is invalid");
         }
+        ScopeMetadata scope = scopeMetadata(request);
         String presetSnapshot = presetSnapshot(request);
         Integer requestedSegment = preview
                 ? optionalInt(request, "segmentIndex", "segmentNumber")
@@ -207,6 +215,9 @@ public class JobService {
                 jdbcTemplate.update("""
                         UPDATE generation_job
                         SET status = CASE WHEN status = 'SUCCESS' THEN status ELSE 'WAITING' END,
+                            run_id = CASE WHEN status = 'SUCCESS' THEN run_id ELSE ? END,
+                            batch_id = CASE WHEN status = 'SUCCESS' THEN batch_id ELSE ? END,
+                            scope_id = CASE WHEN status = 'SUCCESS' THEN scope_id ELSE ? END,
                             preset_snapshot = CASE WHEN status = 'SUCCESS'
                                 THEN preset_snapshot ELSE CAST(? AS jsonb) END,
                             lease_owner = CASE WHEN status = 'SUCCESS' THEN lease_owner ELSE NULL END,
@@ -221,7 +232,7 @@ public class JobService {
                                 THEN result_idempotency_key ELSE NULL END,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
-                        """, presetSnapshot, jobId);
+                        """, scope.runId(), scope.batchId(), scope.scopeId(), presetSnapshot, jobId);
                 jobIds.add(Long.toString(jobId));
             }
             jdbcTemplate.update("""
@@ -235,9 +246,11 @@ public class JobService {
             throw new ApiException("NO_JOBS", 409, "No generation jobs matched the request");
         }
 
-        jdbcTemplate.update("UPDATE book SET status = 'RUNNING', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                book.id());
-        return new JobBatch(book.id(), jobIds, start, end, preview ? "PREVIEW" : "GENERATION", "WAITING");
+        jdbcTemplate.update("UPDATE book SET status = 'RUNNING', active_scope_id = COALESCE(?, active_scope_id), "
+                        + "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                scope.scopeId(), book.id());
+        return new JobBatch(book.id(), jobIds, start, end, preview ? "PREVIEW" : "GENERATION", "WAITING",
+                scope.runId(), scope.batchId(), scope.scopeId());
     }
 
     public void pauseBook(long bookId) {
@@ -665,7 +678,8 @@ public class JobService {
 
     private Optional<BookRow> findBookForUpdate(long bookId) {
         List<BookRow> books = jdbcTemplate.query(
-                "SELECT id, status FROM book WHERE id = ? FOR UPDATE", BOOK_ROW_MAPPER, bookId);
+                "SELECT id, status, active_scope_id FROM book WHERE id = ? FOR UPDATE",
+                BOOK_ROW_MAPPER, bookId);
         return books.stream().findFirst();
     }
 
@@ -705,7 +719,8 @@ public class JobService {
                 SELECT gj.id, gj.status, gj.lease_owner, gj.lease_expires_at,
                        gj.chapter_id, c.chapter_number, bv.book_id, bv.id AS book_version_id,
                        gj.segment_index, gj.error_code, gj.error_message, gj.result_idempotency_key,
-                       b.status AS book_status
+                       b.status AS book_status, gj.run_id, gj.batch_id, gj.scope_id,
+                       b.active_scope_id
                 FROM generation_job gj
                 JOIN chapter c ON c.id = gj.chapter_id
                 JOIN book_version bv ON bv.id = c.book_version_id
@@ -735,6 +750,7 @@ public class JobService {
     private void ensureCurrentLease(JobRow job, String workerId) {
         if (!"RUNNING".equals(job.bookStatus())
                 || !workerId.equals(job.leaseOwner())
+                || !isCurrentScope(job)
                 || !LEASED_STATUSES.contains(job.status())
                 || job.leaseExpiresAt() == null
                 || !job.leaseExpiresAt().isAfter(Instant.now())) {
@@ -745,6 +761,7 @@ public class JobService {
     private void ensureCompletedResultLease(JobRow job, String workerId) {
         if (!"RUNNING".equals(job.bookStatus())
                 || !workerId.equals(job.leaseOwner())
+                || !isCurrentScope(job)
                 || job.leaseExpiresAt() == null
                 || !job.leaseExpiresAt().isAfter(Instant.now())) {
             throw leaseLost();
@@ -754,6 +771,7 @@ public class JobService {
     private void ensureFailureIdempotencyLease(JobRow job, String workerId) {
         if (!"RUNNING".equals(job.bookStatus())
                 || !workerId.equals(job.leaseOwner())
+                || !isCurrentScope(job)
                 || job.leaseExpiresAt() == null
                 || !job.leaseExpiresAt().isAfter(Instant.now())) {
             throw leaseLost();
@@ -762,6 +780,45 @@ public class JobService {
 
     private ApiException leaseLost() {
         return new ApiException("LEASE_LOST", 409, "Worker lease is no longer valid");
+    }
+
+    private boolean isCurrentScope(JobRow job) {
+        return job.scopeId() == null || Objects.equals(job.scopeId(), job.activeScopeId());
+    }
+
+    private ScopeMetadata scopeMetadata(Map<String, Object> request) {
+        Object preset = request.get("preset");
+        Map<?, ?> presetMap = preset instanceof Map<?, ?> ? (Map<?, ?>) preset : Map.of();
+        return new ScopeMetadata(
+                scopeValue(firstPresent(presetMap, request, "runId", "run_id")),
+                scopeValue(firstPresent(presetMap, request, "batchId", "batch_id")),
+                scopeValue(firstPresent(presetMap, request, "scopeId", "scope_id")));
+    }
+
+    private Object firstPresent(Map<?, ?> preferred, Map<String, Object> fallback, String... keys) {
+        for (String key : keys) {
+            if (preferred.containsKey(key) && preferred.get(key) != null) {
+                return preferred.get(key);
+            }
+            if (fallback.containsKey(key) && fallback.get(key) != null) {
+                return fallback.get(key);
+            }
+        }
+        return null;
+    }
+
+    private String scopeValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String normalized = String.valueOf(value).trim();
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        if (normalized.length() > 128) {
+            throw new ApiException("INVALID_REQUEST", 400, "Scope metadata is invalid");
+        }
+        return normalized;
     }
 
     private String presetSnapshot(Map<String, Object> request) {
@@ -793,7 +850,9 @@ public class JobService {
             Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
             while (fields.hasNext()) {
                 Map.Entry<String, JsonNode> field = fields.next();
-                if (SENSITIVE_PRESET_KEYS.contains(normalizeKey(field.getKey()))) {
+                String normalizedKey = normalizeKey(field.getKey());
+                if (SENSITIVE_PRESET_KEYS.contains(normalizedKey)
+                        || SCOPE_METADATA_KEYS.contains(normalizedKey)) {
                     continue;
                 }
                 clean.set(field.getKey(), sanitizeJson(field.getValue()));
@@ -984,7 +1043,7 @@ public class JobService {
         }
     }
 
-    private record BookRow(long id, String status) {
+    private record BookRow(long id, String status, String activeScopeId) {
     }
 
     private record ChapterRef(long id, int chapterNumber) {
@@ -993,7 +1052,8 @@ public class JobService {
     private record JobRow(long id, String status, String leaseOwner, Instant leaseExpiresAt,
                           long chapterId, int chapterNumber, long bookId, long bookVersionId,
                           int segmentIndex, String errorCode, String errorMessage,
-                          String resultIdempotencyKey, String bookStatus) {
+                          String resultIdempotencyKey, String bookStatus, String runId,
+                          String batchId, String scopeId, String activeScopeId) {
     }
 
     private record StagedResult(Path path, String sha256, long sizeBytes) {
@@ -1044,7 +1104,15 @@ public class JobService {
     }
 
     public record JobBatch(long bookId, List<String> jobIds, int chapterStart, int chapterEnd,
-                           String type, String status) {
+                           String type, String status, String runId, String batchId, String scopeId) {
+
+        public JobBatch(long bookId, List<String> jobIds, int chapterStart, int chapterEnd,
+                        String type, String status) {
+            this(bookId, jobIds, chapterStart, chapterEnd, type, status, null, null, null);
+        }
+    }
+
+    private record ScopeMetadata(String runId, String batchId, String scopeId) {
     }
 
     public record TtsModelView(

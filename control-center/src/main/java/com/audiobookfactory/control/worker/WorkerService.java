@@ -117,8 +117,12 @@ public class WorkerService {
     }
 
     public JobClaim claim(String workerToken) {
+        return claim(workerToken, null);
+    }
+
+    public JobClaim claim(String workerToken, String scopeId) {
         WorkerIdentity worker = authenticate(workerToken);
-        return claimRepository.claimNext(worker.workerId(), Instant.now());
+        return claimRepository.claimNext(worker.workerId(), Instant.now(), scopeId);
     }
 
     public void heartbeat(String workerToken, long jobId, Map<String, Object> progress) {

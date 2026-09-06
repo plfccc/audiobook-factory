@@ -100,24 +100,47 @@ class BookControllerTest {
                         .contentType("application/json")
                         .content("""
                                 {"chapterStart":1,"chapterEnd":1,"preset":{
+                                  "runId":"run-a","batchId":"batch-a","scopeId":"scope-a",
                                   "provider":"qwen3-tts",
                                   "model":"Qwen/Qwen3-TTS-12Hz-1.7B-Base",
                                   "modelVersion":"1.0",
                                   "voice":"default",
                                   "language":"zh-CN",
                                   "outputFormat":"wav",
-                                  "clone_prompt":"must-not-be-persisted"
+                                  "modelParameters":{"temperature":0.7,"topP":0.9},
+                                  "clone_prompt":"must-not-be-persisted",
+                                  "secret":"must-not-be-persisted",
+                                  "token":"must-not-be-persisted",
+                                  "password":"must-not-be-persisted",
+                                  "apiKey":"must-not-be-persisted",
+                                  "accessToken":"must-not-be-persisted",
+                                  "enrollmentToken":"must-not-be-persisted"
                                 }}
                                 """))
                 .andExpect(status().isAccepted())
-                .andExpect(jsonPath("$.jobIds").isArray());
+                .andExpect(jsonPath("$.jobIds").isArray())
+                .andExpect(jsonPath("$.runId").value("run-a"))
+                .andExpect(jsonPath("$.batchId").value("batch-a"))
+                .andExpect(jsonPath("$.scopeId").value("scope-a"));
 
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM book WHERE id=?", String.class, bookId))
                 .isEqualTo("RUNNING");
         String presetSnapshot = jdbcTemplate.queryForObject(
                 "SELECT preset_snapshot::text FROM generation_job WHERE chapter_id=1 ORDER BY id LIMIT 1",
                 String.class);
-        assertThat(presetSnapshot).doesNotContain("clone_prompt");
+        assertThat(presetSnapshot)
+                .doesNotContain("clone_prompt", "secret", "token", "password", "apiKey",
+                        "accessToken", "enrollmentToken", "must-not-be-persisted")
+                .contains("modelParameters", "temperature", "0.7", "topP", "0.9");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT run_id FROM generation_job WHERE chapter_id=1 ORDER BY id LIMIT 1", String.class))
+                .isEqualTo("run-a");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT batch_id FROM generation_job WHERE chapter_id=1 ORDER BY id LIMIT 1", String.class))
+                .isEqualTo("batch-a");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT scope_id FROM generation_job WHERE chapter_id=1 ORDER BY id LIMIT 1", String.class))
+                .isEqualTo("scope-a");
 
         mockMvc.perform(post("/api/v1/books/{bookId}/pause", bookId))
                 .andExpect(status().isNoContent());

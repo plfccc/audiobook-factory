@@ -38,6 +38,7 @@ public class JobClaimRepository {
                 JOIN book_version bv ON bv.id = c.book_version_id
                 JOIN book b ON b.id = bv.book_id
                 WHERE b.status = 'RUNNING'
+                  AND gj.scope_id IS NOT DISTINCT FROM COALESCE(?, b.active_scope_id)
                   AND c.status IN ('WAITING', 'RUNNING')
                   AND gj.status = 'WAITING'
                   AND (gj.next_retry_at IS NULL OR gj.next_retry_at <= ?)
@@ -75,7 +76,10 @@ public class JobClaimRepository {
                       gj.preset_snapshot,
                       gj.lease_owner,
                       gj.lease_expires_at,
-                      gj.attempts
+                      gj.attempts,
+                      gj.run_id,
+                      gj.batch_id,
+                      gj.scope_id
             """;
 
     private final JdbcTemplate jdbcTemplate;
@@ -98,14 +102,19 @@ public class JobClaimRepository {
      * @return 领取结果，或无可领取任务时的 {@code null}
      */
     public JobClaim claimNext(String workerId, Instant now) {
+        return claimNext(workerId, now, null);
+    }
+
+    public JobClaim claimNext(String workerId, Instant now, String scopeId) {
         if (workerId == null || workerId.isBlank()) {
             throw new IllegalArgumentException("workerId must not be blank");
         }
         Objects.requireNonNull(now, "now must not be null");
-        return transactionTemplate.execute(status -> claimNextInTransaction(workerId.trim(), now));
+        return transactionTemplate.execute(status ->
+                claimNextInTransaction(workerId.trim(), now, scopeId));
     }
 
-    private JobClaim claimNextInTransaction(String workerId, Instant now) {
+    private JobClaim claimNextInTransaction(String workerId, Instant now, String scopeId) {
         Timestamp timestamp = Timestamp.from(now);
         List<JobClaim> claims = jdbcTemplate.query(
                 CLAIM_SQL,
@@ -120,10 +129,14 @@ public class JobClaimRepository {
                         resultSet.getString("preset_snapshot"),
                         resultSet.getString("lease_owner"),
                         resultSet.getTimestamp("lease_expires_at").toInstant(),
-                        resultSet.getInt("attempts")),
+                        resultSet.getInt("attempts"),
+                        resultSet.getString("run_id"),
+                        resultSet.getString("batch_id"),
+                        resultSet.getString("scope_id")),
                 timestamp,
                 timestamp,
                 timestamp,
+                scopeId,
                 workerId,
                 timestamp,
                 timestamp,

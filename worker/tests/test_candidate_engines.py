@@ -19,6 +19,8 @@ from audiobook_worker.contracts import (
 )
 from audiobook_worker.runtime_probe import RuntimeProbe
 from audiobook_worker.tts_engine import TtsEngine
+from audiobook_worker.colab_worker import _default_engine_factory
+from audiobook_worker.model_registry import ModelRegistry
 
 
 def _write_wav(path: Path) -> None:
@@ -114,6 +116,35 @@ def test_candidate_engine_implements_shared_contract(
     assert len(result.sha256) == 64
     assert loader.calls == [(engine.model_id, "cuda:0")]
     assert len(adapter.calls) == 1
+    assert result.sample_rate == 24_000
+    assert result.channels == 1
+    assert result.duration_seconds == pytest.approx(0.01)
+
+
+def test_candidate_rejects_invalid_wav_and_mismatched_preset(tmp_path: Path):
+    from audiobook_worker.cosyvoice_engine import CosyVoice3Engine
+
+    class BadAdapter(_FakeAdapter):
+        def synthesize(self, model, job, prepared, destination):
+            Path(destination).write_bytes(b"not wav")
+            return Path(destination)
+
+    engine = CosyVoice3Engine(model_loader=_FakeLoader(), model_adapter=BadAdapter())
+    with pytest.raises(RuntimeError, match="invalid WAV"):
+        asyncio.run(engine.synthesize(_job(tmp_path, engine.engine_id, engine.model_id), tmp_path / "bad.wav"))
+
+    mismatched = _job(tmp_path, engine.engine_id, "wrong/model")
+    with pytest.raises(ValueError, match="model"):
+        asyncio.run(engine.synthesize(mismatched, tmp_path / "wrong.wav"))
+
+
+@pytest.mark.parametrize("engine_id", ["cosyvoice3", "indextts-2.5", "f5-tts"])
+def test_default_colab_factory_registers_candidate_models(engine_id: str):
+    profile = next(p for p in ModelRegistry.default().profiles if p.engine_id == engine_id)
+    engine = _default_engine_factory(profile, RuntimeProbe(True, "GPU", 16 * 1024**3, "12", "2", "3"), Path("/tmp/cache"))
+    assert engine.engine_id == profile.engine_id
+    assert engine.model_id == profile.model_id
+    assert engine.model_version == profile.model_version
 
 
 @pytest.mark.parametrize(
@@ -169,3 +200,14 @@ def test_notebook_builder_check_and_secret_safety():
     assert "input(" not in source.lower()
     assert "getpass" not in source.lower()
 
+
+def test_offline_benchmark_runs_each_candidate_and_emits_metrics(tmp_path: Path):
+    from audiobook_worker.benchmark import run_offline_benchmark
+
+    samples = [{"id": "one", "text": "测试。", "language": "zh-CN", "category": "普通叙述"}]
+    rows = asyncio.run(run_offline_benchmark(samples, tmp_path / "audio"))
+    assert {row["engineId"] for row in rows} == {"cosyvoice3", "indextts-2.5", "f5-tts"}
+    assert len(rows) == 3
+    assert all(row["durationSeconds"] > 0 for row in rows)
+    assert all(row["sampleRate"] == 24_000 and row["channels"] == 1 for row in rows)
+    assert all(row["mode"] == "offline-contract" for row in rows)

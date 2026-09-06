@@ -684,16 +684,31 @@ def _default_engine_factory(
     model_profile: ModelProfile,
     runtime: RuntimeProbe,
     cache_dir: Path,
-) -> Qwen3TtsEngine:
-    if model_profile.engine_id != "qwen3-tts":
+) -> Any:
+    if model_profile.engine_id == "qwen3-tts":
+        return Qwen3TtsEngine(model_id=model_profile.model_id, device="cuda:0", cache_dir=cache_dir)
+    if model_profile.engine_id == "cosyvoice3":
+        from .cosyvoice_engine import CosyVoice3Engine
+        engine = CosyVoice3Engine(device="cuda:0")
+        return _validate_registered_engine(engine, model_profile)
+    if model_profile.engine_id == "indextts-2.5":
+        from .indextts_engine import IndexTts25Engine
+        return _validate_registered_engine(IndexTts25Engine(device="cuda:0"), model_profile)
+    if model_profile.engine_id == "f5-tts":
+        from .f5_engine import F5TtsEngine
+        return _validate_registered_engine(F5TtsEngine(device="cuda:0"), model_profile)
+    raise ValueError(f"no Colab engine is registered for {model_profile.engine_id}")
+
+
+def _validate_registered_engine(engine: Any, profile: ModelProfile) -> Any:
+    if (getattr(engine, "engine_id", None), getattr(engine, "model_id", None),
+            getattr(engine, "model_version", None)) != (
+                profile.engine_id, profile.model_id, profile.model_version
+            ):
         raise ValueError(
-            f"no Colab engine is registered for {model_profile.engine_id}"
+            f"registered engine identity does not match model profile: {profile.model_id}"
         )
-    return Qwen3TtsEngine(
-        model_id=model_profile.model_id,
-        device="cuda:0",
-        cache_dir=cache_dir,
-    )
+    return engine
 
 
 def _registration_capabilities(

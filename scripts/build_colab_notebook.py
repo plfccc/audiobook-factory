@@ -16,7 +16,7 @@ TARGET = ROOT / "notebooks" / "audiobook_factory_colab.ipynb"
 
 def build() -> dict:
     sources = [
-        "!pip install -q httpx pydantic-settings soundfile\n",
+        "!git clone -q --depth 1 https://github.com/plfccc/audiobook-factory.git /content/audiobook-factory\n!pip install -q -r /content/audiobook-factory/worker/requirements-colab.txt\n!pip install -q -e /content/audiobook-factory/worker\n",
         """from google.colab import userdata
 import os
 
@@ -29,6 +29,11 @@ runtime = RuntimeProbe.detect()
 if not runtime.cuda_available:
     raise RuntimeError(\"Colab GPU is unavailable; select a GPU runtime before starting the worker\")
 print({\"gpu\": runtime.gpu_name, \"vram_bytes\": runtime.gpu_memory_bytes, \"cuda\": runtime.cuda_version})
+
+import json
+from pathlib import Path
+samples = json.loads(Path(\"/content/audiobook-factory/examples/tts-benchmark.json\").read_text(encoding=\"utf-8\"))
+print({\"benchmark_samples\": len(samples), \"mode\": \"offline-contract-ready\"})
 """,
         """from audiobook_worker.colab_worker import ColabWorker
 

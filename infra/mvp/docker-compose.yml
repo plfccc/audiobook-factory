@@ -59,7 +59,12 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "--silent", "--fail", "http://127.0.0.1:8080/actuator/health"]
+      test:
+        - CMD-SHELL
+        - >-
+          curl --silent --fail
+          -H "Authorization: Bearer $${APP_ACCESS_TOKEN}"
+          http://127.0.0.1:8080/actuator/health
       interval: 10s
       timeout: 3s
       retries: 12

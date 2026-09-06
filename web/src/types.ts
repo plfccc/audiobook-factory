@@ -103,6 +103,17 @@ export interface JobRequest {
   scopeId?: string;
 }
 
+export type WorkerRuntimeStatus = "NOT_CONNECTED" | "ONLINE" | "OFFLINE" | "EXPIRED" | string;
+
+export interface WorkerStatus {
+  status: WorkerRuntimeStatus;
+  workerId?: string | null;
+  name?: string | null;
+  lastHeartbeatAt?: string | null;
+  updatedAt?: string | null;
+  capabilities?: Record<string, unknown> | null;
+}
+
 export interface ApiErrorShape {
   code?: string;
   message?: string;

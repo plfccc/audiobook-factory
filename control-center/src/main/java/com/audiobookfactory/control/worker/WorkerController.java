@@ -52,6 +52,11 @@ public class WorkerController {
         this(workerService, new ObjectMapper());
     }
 
+    @GetMapping("/worker-status")
+    public WorkerService.StatusSnapshot status() {
+        return workerService.status();
+    }
+
     @PostMapping("/workers/register")
     public WorkerService.RegistrationResponse register(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,

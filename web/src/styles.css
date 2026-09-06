@@ -65,6 +65,9 @@ h3 { margin-bottom: 0; font-size: 16px; }
 .count-badge { display: inline-grid; place-items: center; min-width: 27px; height: 27px; padding: 0 7px; border-radius: 8px; background: #f2f4f8; color: var(--muted); font-size: 12px; font-weight: 800; }
 .status-pill { display: inline-flex; align-items: center; min-height: 25px; padding: 0 9px; border-radius: 999px; background: #eef8f4; color: var(--success); font-size: 11px; font-weight: 800; white-space: nowrap; }
 .status-pill-muted { background: #f2f4f8; color: var(--muted); }
+.status-pill-online { background: #eef8f4; color: var(--success); }
+.status-pill-offline { background: #fff8e8; color: var(--warning); }
+.status-pill-expired { background: #fff1f3; color: var(--danger); }
 .status-draft, .status-ready { background: #f2f4f8; color: var(--muted); }
 .status-running { background: #edf2ff; color: var(--primary); }
 .status-paused { background: #fff8e8; color: var(--warning); }
@@ -85,7 +88,9 @@ h3 { margin-bottom: 0; font-size: 16px; }
 .status-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
 .status-item { display: grid; gap: 8px; min-height: 70px; padding: 13px; border-radius: 11px; background: #f8f9fc; }
 .status-item strong { font-size: 13px; }
+.status-value-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-label { font-size: 11px; }
+.status-error { color: var(--danger); }
 .helper-text { margin: 15px 0 0; font-size: 12px; line-height: 1.65; }
 .progress-summary { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
 .progress-number { font-size: 31px; font-weight: 800; letter-spacing: -.04em; }

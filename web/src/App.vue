@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   ApiError,
   AuthRequiredError,
@@ -7,6 +7,7 @@ import {
   getBookProgress,
   getTtsModels,
   getTtsPresets,
+  getWorkerStatus,
   listBooks,
   listChapters,
   listSegments,
@@ -21,7 +22,7 @@ import ChapterTable from "./components/ChapterTable.vue";
 import ErrorCenter from "./components/ErrorCenter.vue";
 import PreviewPanel from "./components/PreviewPanel.vue";
 import WorkerStatus from "./components/WorkerStatus.vue";
-import type { BookSummary, Chapter, ChapterProgress, Segment, TtsModel, TtsPreset } from "./types";
+import type { BookSummary, Chapter, ChapterProgress, Segment, TtsModel, TtsPreset, WorkerStatus as WorkerStatusData } from "./types";
 
 const books = ref<BookSummary[]>([]);
 const selectedBookId = ref<number | null>(null);
@@ -31,6 +32,8 @@ const selectedChapter = ref<Chapter | null>(null);
 const segments = ref<Segment[]>([]);
 const models = ref<TtsModel[]>([]);
 const presets = ref<TtsPreset[]>([]);
+const workerStatus = ref<WorkerStatusData | null>(null);
+const workerStatusError = ref("");
 const loadingBooks = ref(false);
 const loadingBook = ref(false);
 const loadingSegments = ref(false);
@@ -40,6 +43,7 @@ const notice = ref("");
 const errors = ref<string[]>([]);
 const authRequired = ref(false);
 const accessTokenDraft = ref(getAccessToken());
+let workerStatusTimer: number | undefined;
 
 const selectedBook = computed(() => books.value.find((book) => book.id === selectedBookId.value) ?? null);
 const hasRunningBook = computed(() => selectedBook.value?.status === "RUNNING");
@@ -104,8 +108,21 @@ async function loadRuntimeOptions(): Promise<void> {
   else reportError(presetResult.reason);
 }
 
+async function loadWorkerStatus(): Promise<void> {
+  if (!getAccessToken()) return;
+  try {
+    workerStatus.value = await getWorkerStatus();
+    workerStatusError.value = "";
+  } catch (error) {
+    workerStatusError.value = messageFrom(error);
+    if (error instanceof AuthRequiredError || (error instanceof ApiError && error.status === 401)) {
+      authRequired.value = true;
+    }
+  }
+}
+
 async function loadDashboard(): Promise<void> {
-  await Promise.all([loadBooks(), loadRuntimeOptions()]);
+  await Promise.all([loadBooks(), loadRuntimeOptions(), loadWorkerStatus()]);
 }
 
 async function selectBook(bookId: number): Promise<void> {
@@ -197,6 +214,11 @@ function onJobError(message: string): void {
 
 onMounted(() => {
   void loadDashboard();
+  workerStatusTimer = window.setInterval(() => void loadWorkerStatus(), 15_000);
+});
+
+onBeforeUnmount(() => {
+  if (workerStatusTimer !== undefined) window.clearInterval(workerStatusTimer);
 });
 </script>
 
@@ -257,7 +279,11 @@ onMounted(() => {
         </aside>
 
         <section class="workspace-column">
-          <WorkerStatus :error-count="errors.length" />
+          <WorkerStatus
+            :error-count="errors.length"
+            :worker-status="workerStatus"
+            :status-error="workerStatusError"
+          />
           <BookProgress :book="selectedBook" :progress="progress" :loading="loadingBook" />
 
           <section v-if="selectedBook" class="book-toolbar panel">

@@ -8,6 +8,7 @@ import type {
   Segment,
   TtsModel,
   TtsPreset,
+  WorkerStatus,
 } from "./types";
 
 const ACCESS_TOKEN_KEY = "audiobook_factory_access_token";
@@ -142,4 +143,8 @@ export function getTtsModels(): Promise<TtsModel[]> {
 
 export function getTtsPresets(): Promise<TtsPreset[]> {
   return request<TtsPreset[]>("/api/v1/tts/presets");
+}
+
+export function getWorkerStatus(): Promise<WorkerStatus> {
+  return request<WorkerStatus>("/api/v1/worker-status");
 }

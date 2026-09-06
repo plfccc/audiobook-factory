@@ -9,6 +9,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -43,6 +44,7 @@ public class WorkerService {
 
     public static final int LEASE_SECONDS = JobClaimRepository.LEASE_SECONDS;
     private static final Duration WORKER_TOKEN_TTL = Duration.ofHours(12);
+    private static final Duration WORKER_OFFLINE_AFTER = Duration.ofSeconds(90);
     private static final long ENROLLMENT_LOCK_KEY = 4_381_927_611L;
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             "cloneprompt", "workertoken", "enrollmenttoken", "enrolltoken", "accesstoken");
@@ -102,8 +104,9 @@ public class WorkerService {
                 String workerId = "worker-" + UUID.randomUUID();
                 String workerToken = generateToken();
                 jdbcTemplate.update("""
-                        INSERT INTO worker_registration (worker_id, name, capabilities, token_hash, status)
-                        VALUES (?, ?, CAST(? AS jsonb), ?, 'ACTIVE')
+                        INSERT INTO worker_registration
+                            (worker_id, name, capabilities, token_hash, status, last_heartbeat_at)
+                        VALUES (?, ?, CAST(? AS jsonb), ?, 'ACTIVE', CURRENT_TIMESTAMP)
                         """, workerId, workerName, capabilities, sha256(workerToken));
                 return new RegistrationResponse(workerId, workerToken, LEASE_SECONDS, "ACTIVE");
             });
@@ -123,6 +126,39 @@ public class WorkerService {
     public JobClaim claim(String workerToken, String scopeId) {
         WorkerIdentity worker = authenticate(workerToken);
         return claimRepository.claimNext(worker.workerId(), Instant.now(), scopeId);
+    }
+
+    public StatusSnapshot status() {
+        List<WorkerStatusRow> workers = jdbcTemplate.query("""
+                SELECT worker_id, name, status, capabilities, last_heartbeat_at, updated_at
+                FROM worker_registration
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """, (resultSet, rowNum) -> new WorkerStatusRow(
+                resultSet.getString("worker_id"),
+                resultSet.getString("name"),
+                resultSet.getString("status"),
+                resultSet.getString("capabilities"),
+                resultSet.getTimestamp("last_heartbeat_at"),
+                resultSet.getTimestamp("updated_at")));
+        if (workers.isEmpty()) {
+            return StatusSnapshot.notConnected();
+        }
+
+        WorkerStatusRow worker = workers.get(0);
+        Instant lastHeartbeatAt = toInstant(worker.lastHeartbeatAt());
+        Instant updatedAt = toInstant(worker.updatedAt());
+        String status = "ACTIVE".equalsIgnoreCase(worker.status())
+                && lastHeartbeatAt != null
+                && lastHeartbeatAt.plus(WORKER_OFFLINE_AFTER).isAfter(Instant.now())
+                ? "ONLINE" : "ACTIVE".equalsIgnoreCase(worker.status()) ? "OFFLINE" : "EXPIRED";
+        return new StatusSnapshot(
+                status,
+                worker.workerId(),
+                worker.name(),
+                lastHeartbeatAt,
+                updatedAt,
+                parseCapabilities(worker.capabilities()));
     }
 
     public void heartbeat(String workerToken, long jobId, Map<String, Object> progress) {
@@ -190,7 +226,25 @@ public class WorkerService {
                     + "WHERE worker_id=? AND status='ACTIVE'", worker.workerId());
             throw unauthorized();
         }
+        jdbcTemplate.update("UPDATE worker_registration SET last_heartbeat_at=CURRENT_TIMESTAMP, "
+                + "updated_at=CURRENT_TIMESTAMP WHERE worker_id=? AND status='ACTIVE'", worker.workerId());
         return new WorkerIdentity(worker.workerId(), worker.name());
+    }
+
+    private JsonNode parseCapabilities(String value) {
+        if (value == null || value.isBlank()) {
+            return objectMapper.createObjectNode();
+        }
+        try {
+            JsonNode parsed = objectMapper.readTree(value);
+            return parsed == null ? objectMapper.createObjectNode() : parsed;
+        } catch (JsonProcessingException exception) {
+            return objectMapper.createObjectNode();
+        }
+    }
+
+    private Instant toInstant(Timestamp timestamp) {
+        return timestamp == null ? null : timestamp.toInstant();
     }
 
     private String capabilitiesJson(Map<String, Object> body) {
@@ -309,6 +363,10 @@ public class WorkerService {
     private record WorkerRow(String workerId, String name, String status, Timestamp createdAt) {
     }
 
+    private record WorkerStatusRow(String workerId, String name, String status,
+                                   String capabilities, Timestamp lastHeartbeatAt, Timestamp updatedAt) {
+    }
+
     private record AssetRow(String filePath, String format, Long sizeBytes) {
     }
 
@@ -317,6 +375,15 @@ public class WorkerService {
     }
 
     public record WorkerIdentity(String workerId, String name) {
+    }
+
+    public record StatusSnapshot(String status, String workerId, String name,
+                                 Instant lastHeartbeatAt, Instant updatedAt, JsonNode capabilities) {
+
+        public static StatusSnapshot notConnected() {
+            return new StatusSnapshot("NOT_CONNECTED", null, null, null, null,
+                    JsonNodeFactory.instance.objectNode());
+        }
     }
 
     public record AssetDownload(Path path, String format, Long sizeBytes) {

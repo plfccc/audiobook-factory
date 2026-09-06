@@ -2,20 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
+import inspect
 from pathlib import Path
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol
 import wave
 
 from .contracts import EngineCapabilities, GenerationResult, PreparedVoice, TtsJob, VoiceProfile
 from .runtime_probe import RuntimeProbe
 
 
+class CandidateModelLoader(Protocol):
+    """模型特定 loader 的执行边界；实现只能从已存在的本地路径装载。"""
+
+    def load(self, model_id: str, device: str) -> Any:
+        ...
+
+
+@dataclass(frozen=True)
+class CandidateInferenceRequest:
+    """传给 model-specific adapter 的完整请求快照。"""
+
+    text: str
+    model_id: str
+    model_version: str
+    language: str
+    voice: str
+    style_prompt: str
+    parameters_json: str
+    reference_audio_path: Path | None
+    reference_text: str | None
+    design_prompt: str | None
+    destination: Path
+
+
 class CandidateAdapter(Protocol):
-    """候选模型真实推理边界；实现可在 Colab 注入，避免绑定某个模型包 API。"""
+    """候选模型真实推理边界；adapter 不得静默丢弃请求字段。"""
 
     def synthesize(
-        self, model: Any, job: TtsJob, prepared: PreparedVoice, destination: Path
+        self, model: Any, request: CandidateInferenceRequest, destination: Path
     ) -> Path | str | None:
         ...
 
@@ -28,11 +53,22 @@ class LazyCandidateEngine:
     model_version: str
     capabilities: EngineCapabilities
     dependency_name: str
+    model_loader_factory: Callable[[Path | str | None], CandidateModelLoader] | None = None
+    model_adapter_factory: Callable[[], CandidateAdapter] | None = None
 
     def __init__(self, model_loader: Any | None = None, model_adapter: Any | None = None,
-                 probe: RuntimeProbe | None = None, *, device: str = "cuda:0") -> None:
-        self._model_loader = model_loader or _ImportingModelLoader(self.dependency_name)
-        self._model_adapter: CandidateAdapter = model_adapter or _ImportingModelAdapter(self.dependency_name)
+                 probe: RuntimeProbe | None = None, *, device: str = "cuda:0",
+                 model_path: Path | str | None = None) -> None:
+        if model_loader is None:
+            if self.model_loader_factory is None:
+                raise RuntimeError(f"{self.__class__.__name__} has no model-specific loader")
+            model_loader = self.model_loader_factory(model_path)
+        if model_adapter is None:
+            if self.model_adapter_factory is None:
+                raise RuntimeError(f"{self.__class__.__name__} has no model-specific adapter")
+            model_adapter = self.model_adapter_factory()
+        self._model_loader: CandidateModelLoader = model_loader
+        self._model_adapter: CandidateAdapter = model_adapter
         self.probe = probe or RuntimeProbe.detect()
         self.device = device
         self._model: Any | None = None
@@ -81,7 +117,28 @@ class LazyCandidateEngine:
         ))
         output = Path(destination)
         output.parent.mkdir(parents=True, exist_ok=True)
-        generated = await asyncio.to_thread(self._model_adapter.synthesize, model, job, prepared, output)
+        request = CandidateInferenceRequest(
+            text=job.text,
+            model_id=job.preset.model,
+            model_version=job.preset.model_version,
+            language=job.preset.language,
+            voice=job.preset.voice,
+            style_prompt=job.preset.style_prompt,
+            parameters_json=job.preset.parameters_json,
+            reference_audio_path=prepared.reference_audio_path,
+            reference_text=prepared.reference_text,
+            design_prompt=prepared.design_prompt,
+            destination=output,
+        )
+        # The request object is the stable adapter contract. Keep the four-argument
+        # form temporarily usable for the existing offline/fake adapters.
+        synthesize = self._model_adapter.synthesize
+        if len(inspect.signature(synthesize).parameters) == 4:
+            generated = await asyncio.to_thread(
+                synthesize, model, job, prepared, output
+            )
+        else:
+            generated = await asyncio.to_thread(synthesize, model, request, output)
         output = Path(generated or output)
         if not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError(f"{self.__class__.__name__} did not produce WAV output")
@@ -104,58 +161,8 @@ class LazyCandidateEngine:
 
     def _load_model(self) -> Any:
         if self._model is None:
-            loader = self._model_loader
-            self._model = loader.load(self.model_id, self.device) if hasattr(loader, "load") else loader(self.model_id, self.device)
+            self._model = self._model_loader.load(self.model_id, self.device)
         return self._model
-
-
-class _ImportingModelLoader:
-    def __init__(self, dependency_name: str) -> None:
-        self.dependency_name = dependency_name
-
-    def load(self, model_id: str, device: str) -> Any:
-        try:
-            module = importlib.import_module(self.dependency_name)
-        except ImportError as error:
-            raise RuntimeError(
-                f"{self.dependency_name} is not installed; install the optional Colab model package before using this engine"
-            ) from error
-        for name in ("load_model", "from_pretrained", "load"):
-            loader = getattr(module, name, None)
-            if callable(loader):
-                return loader(model_id, device=device)
-        raise RuntimeError(f"{self.dependency_name} adapter has no model loader for {model_id}")
-
-
-class _ImportingModelAdapter:
-    def __init__(self, dependency_name: str) -> None:
-        self.dependency_name = dependency_name
-
-    def synthesize(self, model: Any, job: TtsJob, prepared: PreparedVoice, destination: Path) -> Path:
-        try:
-            module = importlib.import_module(self.dependency_name)
-        except ImportError as error:
-            raise RuntimeError(f"{self.dependency_name} is not installed") from error
-        function = getattr(module, "synthesize", None)
-        if callable(function):
-            result = function(model, job.text, job.preset.language, prepared, destination)
-            return Path(result or destination)
-        for name in ("synthesize", "generate", "infer"):
-            method = getattr(model, name, None)
-            if callable(method):
-                result = method(
-                    job.text,
-                    output_path=str(destination),
-                    language=job.preset.language,
-                    reference_audio=str(prepared.reference_audio_path)
-                    if prepared.reference_audio_path else None,
-                    reference_text=prepared.reference_text,
-                    style_prompt=job.preset.style_prompt,
-                )
-                return Path(result or destination)
-        raise RuntimeError(
-            f"{self.dependency_name} adapter is not configured; provide model_adapter"
-        )
 
 
 def _sha256_file(path: Path) -> str:

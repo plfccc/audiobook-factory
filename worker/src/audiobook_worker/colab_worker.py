@@ -689,14 +689,14 @@ def _default_engine_factory(
         return Qwen3TtsEngine(model_id=model_profile.model_id, device="cuda:0", cache_dir=cache_dir)
     if model_profile.engine_id == "cosyvoice3":
         from .cosyvoice_engine import CosyVoice3Engine
-        engine = CosyVoice3Engine(device="cuda:0")
+        engine = CosyVoice3Engine(device="cuda:0", model_path=cache_dir / model_profile.engine_id)
         return _validate_registered_engine(engine, model_profile)
     if model_profile.engine_id == "indextts-2.5":
         from .indextts_engine import IndexTts25Engine
-        return _validate_registered_engine(IndexTts25Engine(device="cuda:0"), model_profile)
+        return _validate_registered_engine(IndexTts25Engine(device="cuda:0", model_path=cache_dir / model_profile.engine_id), model_profile)
     if model_profile.engine_id == "f5-tts":
         from .f5_engine import F5TtsEngine
-        return _validate_registered_engine(F5TtsEngine(device="cuda:0"), model_profile)
+        return _validate_registered_engine(F5TtsEngine(device="cuda:0", model_path=cache_dir / model_profile.engine_id), model_profile)
     raise ValueError(f"no Colab engine is registered for {model_profile.engine_id}")
 
 

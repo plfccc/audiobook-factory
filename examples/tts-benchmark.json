@@ -1,0 +1,6 @@
+[
+  {"id": "narration", "text": "山风穿过松林，远处的灯火在夜色里一点点亮起来。", "language": "zh-CN", "category": "普通叙述"},
+  {"id": "dialogue", "text": "“你真的决定要走吗？”他低声问道，“这一次，没人会替你回头。”", "language": "zh-CN", "category": "对话"},
+  {"id": "numbers-proper-nouns", "text": "第2024号实验记录显示，灵石储量为128.6万枚，目标地点是天门关。", "language": "zh-CN", "category": "数字与专有名词"},
+  {"id": "long-punctuation-emotion", "text": "他停了很久——久到雨声都像静止了一样，才终于笑道：原来如此。", "language": "zh-CN", "category": "长句、标点与情绪"}
+]

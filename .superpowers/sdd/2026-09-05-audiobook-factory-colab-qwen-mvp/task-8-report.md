@@ -4,7 +4,7 @@
 
 - 新增 `CosyVoice3Engine`、`IndexTts25Engine` 和 `F5TtsEngine` 三个统一 `TtsEngine` 候选适配器。
 - 候选适配器使用延迟导入和本地模型目录；依赖、配置、辅助资源或权重缺失时明确失败，不自动下载权重。
-- CosyVoice 适配器支持本地 `CosyVoice3` 的零样本克隆、SFT 说话人和流式输出合并；IndexTTS 适配器对接 `IndexTTS2.infer`；F5-TTS 适配器对接本地 checkpoint 和本地 vocoder。
+- CosyVoice 适配器支持本地 `CosyVoice3` 的零样本克隆、SFT 说话人和流式输出合并，并对齐官方构造函数参数；IndexTTS 适配器对接 `IndexTTS2.infer`；F5-TTS 适配器对接本地 checkpoint 和本地 vocoder。
 - `CandidateInferenceRequest` 保留 provider、model、version、language、voice、style_prompt、parameters_json、参考音频、参考文本、design_prompt 和目标路径，再进入模型专用映射。
 - `ColabWorker` 的显式 `model_id` 采用严格路由：显存不足时失败，不静默切换；自动选择模式仍由 GPU 选择器选择可用的最高优先级 Qwen 模型。
 - Worker 对引擎返回的路径和 `GenerationResult` 统一执行非符号链接、常规文件、非空、可读 WAV、完整帧、采样率、声道和 SHA256 校验。
@@ -16,7 +16,7 @@
 
 ```text
 $env:PYTHONPATH='worker/src'; python -m pytest -q worker/tests/test_candidate_engines.py worker/tests/test_colab_worker.py worker/tests/test_model_registry.py worker/tests/test_gpu_selector.py
-46 passed
+47 passed
 
 python scripts/build_colab_notebook.py
 python scripts/build_colab_notebook.py --check

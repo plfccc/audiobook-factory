@@ -102,6 +102,7 @@ class BrowserWorker:
         self.registration: Any | None = None
         self._started = False
         self._halted = False
+        self._manual_paused = False
         self._last_error: Exception | None = None
 
     @classmethod
@@ -127,7 +128,7 @@ class BrowserWorker:
         return cls(client, settings=settings, **kwargs)
 
     async def run_once(self) -> bool:
-        if self._halted:
+        if self._halted or self._manual_paused:
             return False
         try:
             if not await self._ensure_started():
@@ -201,6 +202,8 @@ class BrowserWorker:
                     break
                 if processed:
                     continue
+                if self._manual_paused:
+                    await self._maybe_resume_manual_pause()
                 await self._wait(event, self.claim_wait_seconds)
         finally:
             if not self._is_manual_pause_state():
@@ -371,10 +374,30 @@ class BrowserWorker:
             self.state = BrowserWorkerState(code)
         except ValueError:
             self.state = BrowserWorkerState.BACKOFF
-        if code in _MANUAL_PAUSE_CODES or code in _STOP_CODES:
+        if code in _MANUAL_PAUSE_CODES:
+            self._manual_paused = True
+        if code in _STOP_CODES:
             self._halted = True
             if code in _STOP_CODES:
                 self.state = BrowserWorkerState.STOPPED
+
+    async def _maybe_resume_manual_pause(self) -> bool:
+        if not self._manual_paused or self.provider is None:
+            return False
+        health_check = getattr(self.provider, "health_check", None)
+        if not callable(health_check):
+            return False
+        try:
+            status = await _call_async(health_check)
+        except Exception as error:
+            self._last_error = error
+            return False
+        if not bool(getattr(status, "ok", False)):
+            return False
+        self._manual_paused = False
+        self._last_error = None
+        self.state = BrowserWorkerState.IDLE
+        return True
 
     def _ensure_operation_allowed(self, operation_abort: asyncio.Event) -> None:
         if operation_abort.is_set():
@@ -386,7 +409,7 @@ class BrowserWorker:
             raise WorkerError(ErrorCode.HUMAN_REQUIRED, str(code), retryable=False)
 
     def _is_manual_pause_state(self) -> bool:
-        return self._halted and self.state in {
+        return self._manual_paused and self.state in {
             BrowserWorkerState.AUTH_REQUIRED,
             BrowserWorkerState.QUOTA_PAUSED,
             BrowserWorkerState.HUMAN_REQUIRED,

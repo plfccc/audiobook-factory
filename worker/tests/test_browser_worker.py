@@ -5,7 +5,7 @@ import hashlib
 from pathlib import Path
 
 from audiobook_worker.browser_worker import BrowserWorker, BrowserWorkerState
-from audiobook_worker.contracts import GenerationResult, TtsJob, TtsPreset
+from audiobook_worker.contracts import GenerationResult, RuntimeStatus, TtsJob, TtsPreset
 from audiobook_worker.errors import ErrorCode, WorkerError
 
 
@@ -148,3 +148,54 @@ def test_auth_required_pauses_without_reclaiming_jobs(tmp_path):
     assert run_async(worker.run_once()) is False
     assert client.claim_calls == 1
     assert len(client.register_calls) == 1
+
+
+def test_auth_pause_probes_browser_and_resumes_after_manual_login(tmp_path):
+    client = FakeClient(make_job())
+
+    class RecoveringProvider:
+        def __init__(self):
+            self.health_checks = 0
+
+        async def health_check(self):
+            self.health_checks += 1
+            if self.health_checks == 1:
+                return RuntimeStatus(False, ErrorCode.AUTH_REQUIRED, "not signed in")
+            return RuntimeStatus(True, None, "signed in")
+
+    class AuthThenSuccessPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__(tmp_path / "output")
+            self.failed_once = False
+
+        async def run(self, request):
+            if not self.failed_once:
+                self.failed_once = True
+                raise WorkerError(
+                    ErrorCode.AUTH_REQUIRED,
+                    "manual sign-in required",
+                    retryable=False,
+                )
+            return await super().run(request)
+
+    provider = RecoveringProvider()
+    worker = BrowserWorker(
+        client=client,
+        session=FakeSession(),
+        provider=provider,
+        pipeline=AuthThenSuccessPipeline(),
+        output_dir=tmp_path / "output",
+    )
+
+    assert run_async(worker.run_once()) is False
+    assert worker.state is BrowserWorkerState.AUTH_REQUIRED
+    assert client.claim_calls == 1
+
+    assert run_async(worker._maybe_resume_manual_pause()) is False
+    assert worker.state is BrowserWorkerState.AUTH_REQUIRED
+    assert run_async(worker._maybe_resume_manual_pause()) is True
+    assert worker.state is BrowserWorkerState.IDLE
+
+    client.job = make_job()
+    assert run_async(worker.run_once()) is True
+    assert client.claim_calls == 2

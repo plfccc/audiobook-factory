@@ -28,6 +28,8 @@ services:
         HTTPS_PROXY: ${MVP_HTTPS_PROXY:-}
         NO_PROXY: ${MVP_NO_PROXY:-}
         MAVEN_OPTS: ${MVP_MAVEN_OPTS:-}
+        MAVEN_PROXY_HOST: ${MVP_MAVEN_PROXY_HOST:-}
+        MAVEN_PROXY_PORT: ${MVP_MAVEN_PROXY_PORT:-}
     environment:
       PORT: "8080"
       DB_URL: ${DB_URL:-jdbc:postgresql://postgres:5432/audiobook_factory}

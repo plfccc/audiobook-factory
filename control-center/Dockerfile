@@ -4,6 +4,8 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG MAVEN_OPTS
+ARG MAVEN_PROXY_HOST
+ARG MAVEN_PROXY_PORT
 
 ENV HTTP_PROXY=${HTTP_PROXY} \
     HTTPS_PROXY=${HTTPS_PROXY} \
@@ -12,9 +14,26 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
 
 WORKDIR /workspace
 COPY pom.xml ./
-RUN /usr/share/maven/bin/mvn -B -DskipTests dependency:go-offline
+RUN mkdir -p /root/.m2 \
+    && if [[ -n "${MAVEN_PROXY_HOST}" && -n "${MAVEN_PROXY_PORT}" ]]; then \
+        printf '%s\n' \
+          '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">' \
+          '  <proxies>' \
+          '    <proxy>' \
+          '      <id>build-proxy</id>' \
+          '      <active>true</active>' \
+          '      <protocol>http</protocol>' \
+          "      <host>${MAVEN_PROXY_HOST}</host>" \
+          "      <port>${MAVEN_PROXY_PORT}</port>" \
+          '    </proxy>' \
+          '  </proxies>' \
+          '</settings>' > /root/.m2/settings.xml; \
+      else \
+        printf '%s\n' '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"></settings>' > /root/.m2/settings.xml; \
+      fi
+RUN /usr/share/maven/bin/mvn -s /root/.m2/settings.xml -B -DskipTests dependency:go-offline
 COPY src ./src
-RUN /usr/share/maven/bin/mvn -B -DskipTests package
+RUN /usr/share/maven/bin/mvn -s /root/.m2/settings.xml -B -DskipTests package
 
 FROM eclipse-temurin:17-jre-jammy
 

@@ -512,6 +512,30 @@ public class JobService implements ChapterCompletionPort {
         });
     }
 
+    public Path openChapterAudio(long chapterId) {
+        requirePositiveId(chapterId, "chapterId");
+        List<String> paths = jdbcTemplate.query(
+                "SELECT final_audio_path FROM chapter WHERE id = ?",
+                (resultSet, rowNum) -> resultSet.getString("final_audio_path"), chapterId);
+        if (paths.isEmpty()) {
+            throw new ApiException("CHAPTER_NOT_FOUND", 404, "Chapter was not found");
+        }
+        String storedPath = paths.get(0);
+        if (storedPath == null || storedPath.isBlank()) {
+            throw new ApiException("CHAPTER_AUDIO_NOT_FOUND", 404, "Chapter audio is not ready");
+        }
+        Path audioPath;
+        try {
+            audioPath = safeChapterAudioPath(storedPath);
+        } catch (ApiException exception) {
+            throw new ApiException("CHAPTER_AUDIO_NOT_FOUND", 404, "Chapter audio is not ready");
+        }
+        if (!Files.isRegularFile(audioPath, LinkOption.NOFOLLOW_LINKS)) {
+            throw new ApiException("CHAPTER_AUDIO_NOT_FOUND", 404, "Chapter audio is not ready");
+        }
+        return audioPath;
+    }
+
     public JsonNode workerPreset(String presetSnapshot) {
         if (presetSnapshot == null || presetSnapshot.isBlank()) {
             return objectMapper.createObjectNode();

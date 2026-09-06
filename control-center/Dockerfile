@@ -15,7 +15,7 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
 WORKDIR /workspace
 COPY pom.xml ./
 RUN mkdir -p /root/.m2 \
-    && if [[ -n "${MAVEN_PROXY_HOST}" && -n "${MAVEN_PROXY_PORT}" ]]; then \
+    && if [ -n "${MAVEN_PROXY_HOST}" ] && [ -n "${MAVEN_PROXY_PORT}" ]; then \
         printf '%s\n' \
           '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">' \
           '  <proxies>' \

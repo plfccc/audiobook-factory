@@ -86,6 +86,40 @@ class WorkerControllerTest {
     }
 
     @Test
+    void sameServerWorkerCanReenrollAfterRestartAndRotatesItsCredential() throws Exception {
+        String firstResponse = mockMvc.perform(post("/api/v1/workers/register")
+                        .header("Authorization", "Bearer test-enroll-token")
+                        .contentType("application/json")
+                        .content("{\"workerName\":\"server-playwright-worker\",\"runtime\":{},\"capabilities\":{}}"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        String firstToken = firstResponse.replaceAll(
+                ".*\\\"workerToken\\\"\\s*:\\s*\\\"([^\\\"]+)\\\".*", "$1");
+
+        String secondResponse = mockMvc.perform(post("/api/v1/workers/register")
+                        .header("Authorization", "Bearer test-enroll-token")
+                        .contentType("application/json")
+                        .content("{\"workerName\":\"server-playwright-worker\",\"runtime\":{\"restart\":true},\"capabilities\":{}}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.workerId").value(firstResponse.replaceAll(
+                        ".*\\\"workerId\\\"\\s*:\\s*\\\"([^\\\"]+)\\\".*", "$1")))
+                .andReturn().getResponse().getContentAsString();
+        String secondToken = secondResponse.replaceAll(
+                ".*\\\"workerToken\\\"\\s*:\\s*\\\"([^\\\"]+)\\\".*", "$1");
+
+        assertThat(secondToken).isNotEqualTo(firstToken);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM worker_registration", Integer.class))
+                .isEqualTo(1);
+
+        mockMvc.perform(post("/api/v1/workers/claim")
+                        .header("Authorization", "Bearer " + firstToken))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(post("/api/v1/workers/claim")
+                        .header("Authorization", "Bearer " + secondToken))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
     void workerProtocolUsesBearerTokenAndRejectsLostLeaseWithoutChangingTheJob() throws Exception {
         String response = mockMvc.perform(post("/api/v1/workers/register")
                         .header("Authorization", "Bearer test-enroll-token")

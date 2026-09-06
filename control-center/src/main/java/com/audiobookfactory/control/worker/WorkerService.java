@@ -95,14 +95,32 @@ public class WorkerService {
             RegistrationResponse result = transactionTemplate.execute(status -> {
                 // PostgreSQL advisory transaction lock makes the one-time enrollment atomic across instances.
                 jdbcTemplate.execute("SELECT pg_advisory_xact_lock(" + ENROLLMENT_LOCK_KEY + ")");
-                Boolean used = jdbcTemplate.queryForObject(
-                        "SELECT EXISTS (SELECT 1 FROM worker_registration)", Boolean.class);
-                if (Boolean.TRUE.equals(used)) {
-                    throw unauthorized();
+                String workerToken = generateToken();
+                List<ExistingRegistration> existing = jdbcTemplate.query("""
+                        SELECT worker_id, name
+                        FROM worker_registration
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """, (resultSet, rowNum) -> new ExistingRegistration(
+                        resultSet.getString("worker_id"), resultSet.getString("name")));
+                if (!existing.isEmpty()) {
+                    ExistingRegistration registration = existing.get(0);
+                    // 单用户部署只允许原 Worker 名称重新入站，避免 enrollment token 被用来替换任意 Worker。
+                    if (!registration.name().equals(workerName)) {
+                        throw unauthorized();
+                    }
+                    jdbcTemplate.update("""
+                            UPDATE worker_registration
+                            SET capabilities = CAST(? AS jsonb), token_hash = ?, status = 'ACTIVE',
+                                last_heartbeat_at = CURRENT_TIMESTAMP, created_at = CURRENT_TIMESTAMP,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE worker_id = ?
+                            """, capabilities, sha256(workerToken), registration.workerId());
+                    return new RegistrationResponse(registration.workerId(), workerToken,
+                            LEASE_SECONDS, "ACTIVE");
                 }
 
                 String workerId = "worker-" + UUID.randomUUID();
-                String workerToken = generateToken();
                 jdbcTemplate.update("""
                         INSERT INTO worker_registration
                             (worker_id, name, capabilities, token_hash, status, last_heartbeat_at)
@@ -361,6 +379,9 @@ public class WorkerService {
     }
 
     private record WorkerRow(String workerId, String name, String status, Timestamp createdAt) {
+    }
+
+    private record ExistingRegistration(String workerId, String name) {
     }
 
     private record WorkerStatusRow(String workerId, String name, String status,

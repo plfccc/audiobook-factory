@@ -40,6 +40,9 @@ services:
     depends_on:
       proxy:
         condition: service_healthy
+    networks:
+      - default
+      - mvp
     restart: unless-stopped
 
   worker:
@@ -51,12 +54,22 @@ services:
         condition: service_healthy
     environment:
       CDP_URL: http://127.0.0.1:9222
-      OUTPUT_DIR: /data/books
+      AI_STUDIO_URL: https://aistudio.google.com/generate-speech
+      AUDIOBOOK_CONTROL_URL: ${AUDIOBOOK_CONTROL_URL:-http://control-center:8080}
+      AUDIOBOOK_WORKER_TOKEN: ${AUDIOBOOK_WORKER_TOKEN:?AUDIOBOOK_WORKER_TOKEN is required}
+      AUDIOBOOK_ALLOW_INSECURE_HTTP: "false"
+      WORKER_NAME: ${WORKER_NAME:-server-playwright-worker}
+      OUTPUT_DIR: /tmp/audiobook-worker-output
       DIAGNOSTICS_DIR: /data/diagnostics
     volumes:
-      - ../../data/books:/data/books
       - ../../data/diagnostics:/data/diagnostics
       - ../../examples:/app/examples:ro
     working_dir: /app
+    command: ["python", "-m", "audiobook_worker.browser_worker"]
     init: true
     restart: unless-stopped
+
+networks:
+  mvp:
+    external: true
+    name: audiobook-factory-mvp

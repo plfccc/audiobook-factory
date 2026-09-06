@@ -27,4 +27,4 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-CMD ["sleep", "infinity"]
+CMD ["python", "-m", "audiobook_worker.browser_worker"]

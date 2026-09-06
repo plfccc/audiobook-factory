@@ -120,6 +120,7 @@ public class JobService implements ChapterCompletionPort {
     private final Path libraryRoot;
     private final FfmpegMediaService mediaService;
     private final LibraryPublishService libraryPublishService;
+    private final AtomicResultMover resultMover;
 
     @Autowired
     public JobService(JdbcTemplate jdbcTemplate,
@@ -129,7 +130,7 @@ public class JobService implements ChapterCompletionPort {
                       FfmpegMediaService mediaService,
                       LibraryPublishService libraryPublishService) {
         this(jdbcTemplate, transactionManager, objectMapper, appProperties.storageRoot(),
-                mediaService, libraryPublishService);
+                mediaService, libraryPublishService, JobService::moveWithoutOverwrite);
     }
 
     public JobService(JdbcTemplate jdbcTemplate,
@@ -145,6 +146,17 @@ public class JobService implements ChapterCompletionPort {
                       Path storageRoot,
                       FfmpegMediaService mediaService,
                       LibraryPublishService libraryPublishService) {
+        this(jdbcTemplate, transactionManager, objectMapper, storageRoot,
+                mediaService, libraryPublishService, JobService::moveWithoutOverwrite);
+    }
+
+    JobService(JdbcTemplate jdbcTemplate,
+               PlatformTransactionManager transactionManager,
+               ObjectMapper objectMapper,
+               Path storageRoot,
+               FfmpegMediaService mediaService,
+               LibraryPublishService libraryPublishService,
+               AtomicResultMover resultMover) {
         this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
         this.transactionTemplate = new TransactionTemplate(
                 Objects.requireNonNull(transactionManager, "transactionManager must not be null"));
@@ -154,6 +166,7 @@ public class JobService implements ChapterCompletionPort {
         this.libraryRoot = libraryRootFromEnvironment();
         this.mediaService = mediaService;
         this.libraryPublishService = libraryPublishService;
+        this.resultMover = Objects.requireNonNull(resultMover, "resultMover must not be null");
     }
 
     public JobBatch createPreview(long bookId, Map<String, Object> request) {
@@ -456,7 +469,9 @@ public class JobService implements ChapterCompletionPort {
             }
             publishReadyChapter(job, owner);
         } finally {
-            deleteQuietly(staged.path());
+            if (!target.preserveStaged()) {
+                deleteQuietly(staged.path());
+            }
             if (target.moved() && !target.committed()) {
                 deleteQuietly(target.finalPath());
             }
@@ -713,9 +728,13 @@ public class JobService implements ChapterCompletionPort {
                 }
                 Files.deleteIfExists(stagedPath);
             } else {
-                moveWithoutOverwrite(stagedPath, finalPath);
+                resultMover.move(stagedPath, finalPath);
                 target.moved(finalPath);
             }
+        } catch (AtomicMoveNotSupportedException exception) {
+            target.markPreserveStaged();
+            throw new ApiException("RESULT_STORAGE_FAILED", 500,
+                    "Atomic result promotion is not supported");
         } catch (IOException exception) {
             throw new ApiException("RESULT_STORAGE_FAILED", 500, "Unable to store result audio");
         }
@@ -1316,11 +1335,7 @@ public class JobService implements ChapterCompletionPort {
     }
 
     private static void moveWithoutOverwrite(Path source, Path target) throws IOException {
-        try {
-            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException exception) {
-            throw new IOException("Atomic result promotion is not supported", exception);
-        }
+        Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static void deleteQuietly(Path path) {
@@ -1380,6 +1395,7 @@ public class JobService implements ChapterCompletionPort {
         private Path finalPath;
         private boolean moved;
         private boolean committed;
+        private boolean preserveStaged;
 
         private void moved(Path finalPath) {
             this.finalPath = finalPath;
@@ -1401,6 +1417,19 @@ public class JobService implements ChapterCompletionPort {
         private boolean committed() {
             return committed;
         }
+
+        private void markPreserveStaged() {
+            this.preserveStaged = true;
+        }
+
+        private boolean preserveStaged() {
+            return preserveStaged;
+        }
+    }
+
+    @FunctionalInterface
+    interface AtomicResultMover {
+        void move(Path source, Path target) throws IOException;
     }
 
     public record JobBatch(long bookId, List<String> jobIds, int chapterStart, int chapterEnd,

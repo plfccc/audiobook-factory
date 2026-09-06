@@ -104,3 +104,14 @@
 `rtk cmd /c "C:/Users/lingpfeng.peng/.codex/bin/mvn-auto.cmd -f control-center/pom.xml -Dtest=FfmpegMediaServiceTest,MediaToolRunnerTest,LibraryPublishServiceTest,JobServiceAudioPipelineTest test"`
 
 结果：25 tests，Failures 0，Errors 0，Skipped 1，`BUILD SUCCESS`。未等待 Docker 或真实 ffmpeg。
+
+## Fix round 3（2026-09-06）
+
+- `JobService.recordResult` 现在通过明确的原子提升标记区分 `AtomicMoveNotSupportedException`；该 fail-closed 分支保留 staged WAV 以便恢复/重试，其他失败继续由 finally 清理临时文件。
+- `JobService` 的结果 mover 支持测试注入，新增原子提升不支持时 staged 文件仍存在的 focused 回归测试。
+
+目标测试：
+
+`rtk cmd /c "C:/Users/lingpfeng.peng/.codex/bin/mvn-auto.cmd -f control-center/pom.xml -Dtest=FfmpegMediaServiceTest,JobServiceAudioPipelineTest test"`
+
+结果：22 tests，Failures 0，Errors 0，Skipped 1，`BUILD SUCCESS`。未等待 Docker 或真实 ffmpeg。

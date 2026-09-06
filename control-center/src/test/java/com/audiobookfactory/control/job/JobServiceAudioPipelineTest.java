@@ -17,6 +17,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionStatus;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.Timestamp;
@@ -24,6 +25,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -149,6 +151,35 @@ class JobServiceAudioPipelineTest {
         service.recordResult(1, "worker-1", result, metadata);
 
         verify(libraryPublishService, org.mockito.Mockito.times(2)).publishChapter(any(), any());
+    }
+
+    @Test
+    void preservesStagedResultWhenAtomicPromotionIsUnsupported() throws Exception {
+        byte[] audio = new byte[2048];
+        String sha256 = sha256(audio);
+        when(mediaService.validate(any(Path.class))).thenReturn(
+                AudioValidationResult.valid(2048, 1.25, "pcm_s16le", 24_000, 1, sha256));
+        Path storageRoot = Files.createTempDirectory("job-service-atomic-result-");
+        JobService unsupported = new JobService(
+                jdbcTemplate, transactionManager, new ObjectMapper(), storageRoot,
+                mediaService, libraryPublishService, (source, target) -> {
+                    throw new java.nio.file.AtomicMoveNotSupportedException(
+                            source.toString(), target.toString(), "atomic move unavailable");
+                });
+
+        assertThatThrownBy(() -> unsupported.recordResult(
+                1, "worker-1", new MockMultipartFile(
+                        "audio", "result.wav", "audio/wav", audio),
+                "{\"sha256\":\"" + sha256 + "\",\"sizeBytes\":2048}"))
+                .isInstanceOf(ApiException.class)
+                .extracting("code")
+                .isEqualTo("RESULT_STORAGE_FAILED");
+
+        Path staging = storageRoot.resolve(".staging").resolve("results");
+        try (var files = Files.list(staging)) {
+            assertThat(files.toList())
+                    .anyMatch(path -> path.getFileName().toString().endsWith(".upload"));
+        }
     }
 
     private void stubJobRow() throws Exception {

@@ -79,7 +79,9 @@ registry = ModelRegistry.default()
 profiles = {profile.model_id: profile for profile in registry.profiles}
 candidate_ids = tuple(profile.model_id for profile in registry.profiles if profile.engine_id != "qwen3-tts")
 SELECTED_MODEL_ID = os.environ.get("AUDIOBOOK_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-BENCHMARK_MODEL_IDS = tuple(x.strip() for x in os.environ.get("BENCHMARK_MODEL_IDS", ",".join(candidate_ids)).split(",") if x.strip())
+BENCHMARK_MODEL_IDS = tuple(x.strip() for x in os.environ.get("BENCHMARK_MODEL_IDS", "").split(",") if x.strip())
+if not BENCHMARK_MODEL_IDS and SELECTED_MODEL_ID in candidate_ids:
+    BENCHMARK_MODEL_IDS = (SELECTED_MODEL_ID,)
 selected_model_id = SELECTED_MODEL_ID
 benchmark_ids = BENCHMARK_MODEL_IDS
 mode = os.environ.get("BENCHMARK_MODE", "offline-contract")
@@ -93,13 +95,15 @@ def select_candidate_profile(model_id: str | None = None):
 
 for model_id in (selected_model_id, *benchmark_ids):
     select_candidate_profile(model_id)
-if mode == "real-candidate" and not os.environ.get("AUDIOBOOK_REFERENCE_AUDIO"):
+if mode == "real-candidate" and benchmark_ids and not os.environ.get("AUDIOBOOK_REFERENCE_AUDIO"):
     raise RuntimeError("AUDIOBOOK_REFERENCE_AUDIO is required for real-candidate benchmark")
 samples = Path("/content/audiobook-factory/examples/tts-benchmark.json")
 RESULT_FIELDS = ("engine", "model", "version", "sample", "language", "category", "duration", "sampleRate", "channels", "size", "elapsed", "rtf", "gpu", "vram", "startup", "failure")
 
 def run_candidate_benchmark(model_ids=None, benchmark_mode=mode):
     requested = tuple(model_ids or BENCHMARK_MODEL_IDS)
+    if not requested:
+        return []
     for model_id in requested:
         select_candidate_profile(model_id)
     return run_from_json(

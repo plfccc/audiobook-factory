@@ -43,3 +43,11 @@
 - 保留并收敛已有 scope/claim 链路：scope 元数据落库、claim 过滤、Worker 返回字段及 migration；已有 FailureSanitizer 改动和安全测试一并保留，本轮未新增其行为。
 - 验证：HST `mvn-auto.cmd -f control-center/pom.xml -q -DskipTests compile` 成功；目标 Java 测试 68 个，`Failures 0`、`Errors 0`、`Skipped 1`；`git diff --check` 通过。
 - 限制：Docker/Testcontainers 未等待或启动，因此未执行真实 PostgreSQL/Flyway/并发 claim 事务验证。
+
+## 第 3/5 轮：lease 回收与 scope 一致性（2026-09-06）
+
+- 本轮代码与回归测试 patch-id：`8aecbf4bfd0e4db89bc025ce0838869b79db54c2`。
+- 过期的 `LEASED`、`GENERATING`、`UPLOADING` job 统一恢复为 `WAITING`，并清除 owner、lease、heartbeat、`error_code`、`error_message`、`next_retry_at`；保留 `FOR UPDATE SKIP LOCKED` 和 300 秒 lease。
+- claim 同时要求 `generation_job.scope_id` 与 `book.active_scope_id` 一致，并继续校验显式 scope；无 scope 创建首次生成 scope，重建时复用书籍 active scope，避免 job scope 与 active scope 不一致。
+- TDD：RED 为目标单元测试 7 个中 4 个失败；GREEN 后 HST compile 成功，目标 Java 测试 71 个、`Failures 0`、`Errors 0`、`Skipped 1`；Task 5 Python 回归 `38 passed`；`git diff --check` 通过。
+- Docker/JDBC 顾虑：未启动或等待 Docker/Testcontainers，未完成真实 PostgreSQL/Flyway、同书多 scope、过期 lease CTE 和并发 claim 事务验证；当前由 SQL 绑定断言、更新断言及可用的 Mockito/服务测试覆盖。

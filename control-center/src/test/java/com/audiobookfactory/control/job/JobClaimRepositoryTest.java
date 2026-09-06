@@ -109,6 +109,33 @@ class JobClaimRepositoryTest {
     }
 
     @Test
+    void expiredLeaseRecoveryClearsAllLeaseRetryAndErrorMetadataBeforeClaiming() {
+        insertBookWithJobs("PAUSED", List.of(1), List.of());
+        jdbcTemplate.update("UPDATE generation_job SET status='UPLOADING', lease_owner=?, "
+                        + "lease_expires_at=?, heartbeat_at=?, error_code=?, error_message=?, "
+                        + "next_retry_at=? WHERE id=1",
+                "dead-worker", Instant.parse("2026-09-04T23:59:00Z"),
+                Instant.parse("2026-09-04T23:58:00Z"), "STALE", "stale message",
+                Instant.parse("2026-09-04T23:59:30Z"));
+
+        assertThat(repository.claimNext("worker-2", Instant.parse("2026-09-05T00:00:00Z"))).isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM generation_job WHERE id=1", String.class))
+                .isEqualTo("WAITING");
+        assertThat(jdbcTemplate.queryForObject("SELECT lease_owner FROM generation_job WHERE id=1", String.class))
+                .isNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT lease_expires_at FROM generation_job WHERE id=1", Instant.class)).isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT heartbeat_at FROM generation_job WHERE id=1", Instant.class))
+                .isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT error_code FROM generation_job WHERE id=1", String.class))
+                .isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT error_message FROM generation_job WHERE id=1", String.class))
+                .isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT next_retry_at FROM generation_job WHERE id=1", Instant.class))
+                .isNull();
+    }
+
+    @Test
     void concurrentWorkersClaimDifferentRowsWithoutDuplicateLease() throws Exception {
         insertBookWithJobs("RUNNING", List.of(1, 2), List.of());
         ExecutorService executor = Executors.newFixedThreadPool(2);
@@ -149,6 +176,21 @@ class JobClaimRepositoryTest {
         assertThat(claim.scopeId()).isEqualTo("scope-a");
         assertThat(repository.claimNext(
                 "worker-a", Instant.parse("2026-09-05T00:00:01Z"), "scope-a")).isNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM generation_job WHERE id=2", String.class)).isEqualTo("WAITING");
+    }
+
+    @Test
+    void explicitScopeCannotClaimNonActiveScopeFromTheSameBook() {
+        insertBookWithJobs("RUNNING", List.of(1, 2), List.of());
+        jdbcTemplate.update("UPDATE generation_job SET scope_id=? WHERE id=1", "scope-a");
+        jdbcTemplate.update("UPDATE generation_job SET scope_id=? WHERE id=2", "scope-b");
+        jdbcTemplate.update("UPDATE book SET active_scope_id=? WHERE id=1", "scope-a");
+
+        assertThat(repository.claimNext(
+                "worker-b", Instant.parse("2026-09-05T00:00:00Z"), "scope-b")).isNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM generation_job WHERE id=1", String.class)).isEqualTo("WAITING");
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT status FROM generation_job WHERE id=2", String.class)).isEqualTo("WAITING");
     }

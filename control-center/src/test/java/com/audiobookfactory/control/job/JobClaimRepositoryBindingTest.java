@@ -58,7 +58,14 @@ class JobClaimRepositoryBindingTest {
         Timestamp timestamp = Timestamp.from(now);
         Object[] boundArguments = arguments.getValue();
         assertThat(sql.getValue()).contains("FOR UPDATE OF gj SKIP LOCKED")
-                .contains("interval '5 minutes'");
+                .contains("interval '5 minutes'")
+                .contains("status = 'WAITING'")
+                .contains("lease_owner = NULL")
+                .contains("lease_expires_at = NULL")
+                .contains("heartbeat_at = NULL")
+                .contains("error_code = NULL")
+                .contains("error_message = NULL")
+                .contains("next_retry_at = NULL");
         assertThat(boundArguments).hasSize((int) sql.getValue().chars()
                 .filter(character -> character == '?')
                 .count());

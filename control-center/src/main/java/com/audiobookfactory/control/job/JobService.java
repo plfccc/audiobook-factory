@@ -193,7 +193,7 @@ public class JobService {
         if (start <= 0 || end < start) {
             throw new ApiException("INVALID_CHAPTER_RANGE", 400, "Chapter range is invalid");
         }
-        ScopeMetadata scope = scopeMetadata(request);
+        ScopeMetadata scope = scopeMetadata(request, book.activeScopeId());
         String presetSnapshot = presetSnapshot(request);
         Integer requestedSegment = preview
                 ? optionalInt(request, "segmentIndex", "segmentNumber")
@@ -786,13 +786,19 @@ public class JobService {
         return job.scopeId() == null || Objects.equals(job.scopeId(), job.activeScopeId());
     }
 
-    private ScopeMetadata scopeMetadata(Map<String, Object> request) {
+    private ScopeMetadata scopeMetadata(Map<String, Object> request, String activeScopeId) {
         Object preset = request.get("preset");
         Map<?, ?> presetMap = preset instanceof Map<?, ?> ? (Map<?, ?>) preset : Map.of();
+        String requestedScopeId = scopeValue(firstPresent(presetMap, request, "scopeId", "scope_id"));
+        String effectiveScopeId = requestedScopeId == null
+                ? scopeValue(activeScopeId) : requestedScopeId;
+        if (effectiveScopeId == null) {
+            effectiveScopeId = "scope-" + UUID.randomUUID();
+        }
         return new ScopeMetadata(
                 scopeValue(firstPresent(presetMap, request, "runId", "run_id")),
                 scopeValue(firstPresent(presetMap, request, "batchId", "batch_id")),
-                scopeValue(firstPresent(presetMap, request, "scopeId", "scope_id")));
+                effectiveScopeId);
     }
 
     private Object firstPresent(Map<?, ?> preferred, Map<String, Object> fallback, String... keys) {

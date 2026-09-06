@@ -27,6 +27,9 @@ public class JobClaimRepository {
                     lease_owner = NULL,
                     lease_expires_at = NULL,
                     heartbeat_at = NULL,
+                    error_code = NULL,
+                    error_message = NULL,
+                    next_retry_at = NULL,
                     updated_at = ?
                 WHERE status IN ('LEASED', 'GENERATING', 'UPLOADING')
                   AND lease_expires_at IS NOT NULL
@@ -38,6 +41,7 @@ public class JobClaimRepository {
                 JOIN book_version bv ON bv.id = c.book_version_id
                 JOIN book b ON b.id = bv.book_id
                 WHERE b.status = 'RUNNING'
+                  AND gj.scope_id IS NOT DISTINCT FROM b.active_scope_id
                   AND gj.scope_id IS NOT DISTINCT FROM COALESCE(?, b.active_scope_id)
                   AND c.status IN ('WAITING', 'RUNNING')
                   AND gj.status = 'WAITING'

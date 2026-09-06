@@ -71,4 +71,14 @@ class JobClaimRepositorySqlTest {
         assertThat(sql.getValue()).contains("scope_id");
         assertThat(List.of(arguments.getValue())).contains("scope-a");
     }
+
+    @Test
+    void claimRequiresTheJobScopeToMatchTheBookActiveScope() {
+        repository.claimNext("worker-1", Instant.parse("2026-09-05T00:00:00Z"), "scope-a");
+
+        ArgumentCaptor<String> sql = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).query(sql.capture(), any(RowMapper.class), any(Object[].class));
+
+        assertThat(sql.getValue()).contains("gj.scope_id IS NOT DISTINCT FROM b.active_scope_id");
+    }
 }

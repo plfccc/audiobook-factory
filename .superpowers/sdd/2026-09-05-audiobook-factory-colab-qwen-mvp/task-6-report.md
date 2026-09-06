@@ -51,3 +51,11 @@
 - claim 同时要求 `generation_job.scope_id` 与 `book.active_scope_id` 一致，并继续校验显式 scope；无 scope 创建首次生成 scope，重建时复用书籍 active scope，避免 job scope 与 active scope 不一致。
 - TDD：RED 为目标单元测试 7 个中 4 个失败；GREEN 后 HST compile 成功，目标 Java 测试 71 个、`Failures 0`、`Errors 0`、`Skipped 1`；Task 5 Python 回归 `38 passed`；`git diff --check` 通过。
 - Docker/JDBC 顾虑：未启动或等待 Docker/Testcontainers，未完成真实 PostgreSQL/Flyway、同书多 scope、过期 lease CTE 和并发 claim 事务验证；当前由 SQL 绑定断言、更新断言及可用的 Mockito/服务测试覆盖。
+
+## 第 4/5 轮：过期 lease 同调用 reclaim（2026-09-06）
+
+- 本轮代码与回归测试 patch-id：`3dd3b5158a622a5c7db43c312587f9bb612bacfc`。
+- 根因是 PostgreSQL data-modifying `expired` CTE 与 candidate 主查询共享 statement snapshot；本轮拆为同一 `TransactionTemplate` 内先清理过期 lease、再执行 candidate/lease `UPDATE ... RETURNING`，使一次 `claimNext` 可领取刚恢复的 job。
+- 过期清理继续完整重置 status、owner、lease、heartbeat、`error_code`、`error_message`、`next_retry_at`；candidate 继续保留 `FOR UPDATE OF gj SKIP LOCKED`、5 分钟 lease 和 active scope 条件。
+- TDD：RED 为目标绑定/SQL测试 7 个中 5 个失败；GREEN 后 HST compile 成功，目标 Java 测试 73 个、`Failures 0`、`Errors 0`、`Skipped 1`；Task 5 Python 回归 `38 passed`；`git diff --check` 通过。
+- Docker/JDBC 顾虑：未启动或等待 Docker/Testcontainers；既有真实 PostgreSQL 同调用 reclaim、snapshot 可见性、行锁竞争、Flyway/JDBC 参数执行仍 Deferred，本轮以绑定顺序、SQL 结构和无 Docker 同调用模拟覆盖。

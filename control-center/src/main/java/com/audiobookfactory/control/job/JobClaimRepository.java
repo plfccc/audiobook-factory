@@ -20,21 +20,23 @@ public class JobClaimRepository {
 
     public static final int LEASE_SECONDS = 300;
 
+    private static final String EXPIRED_LEASE_SQL = """
+            UPDATE generation_job
+            SET status = 'WAITING',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                error_code = NULL,
+                error_message = NULL,
+                next_retry_at = NULL,
+                updated_at = ?
+            WHERE status IN ('LEASED', 'GENERATING', 'UPLOADING')
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            """;
+
     private static final String CLAIM_SQL = """
-            WITH expired AS (
-                UPDATE generation_job
-                SET status = 'WAITING',
-                    lease_owner = NULL,
-                    lease_expires_at = NULL,
-                    heartbeat_at = NULL,
-                    error_code = NULL,
-                    error_message = NULL,
-                    next_retry_at = NULL,
-                    updated_at = ?
-                WHERE status IN ('LEASED', 'GENERATING', 'UPLOADING')
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= ?
-            ), candidate AS (
+            WITH candidate AS (
                 SELECT gj.id
                 FROM generation_job gj
                 JOIN chapter c ON c.id = gj.chapter_id
@@ -120,6 +122,7 @@ public class JobClaimRepository {
 
     private JobClaim claimNextInTransaction(String workerId, Instant now, String scopeId) {
         Timestamp timestamp = Timestamp.from(now);
+        jdbcTemplate.update(EXPIRED_LEASE_SQL, timestamp, timestamp);
         List<JobClaim> claims = jdbcTemplate.query(
                 CLAIM_SQL,
                 (resultSet, rowNum) -> new JobClaim(
@@ -137,10 +140,8 @@ public class JobClaimRepository {
                         resultSet.getString("run_id"),
                         resultSet.getString("batch_id"),
                         resultSet.getString("scope_id")),
-                timestamp,
-                timestamp,
-                timestamp,
                 scopeId,
+                timestamp,
                 workerId,
                 timestamp,
                 timestamp,

@@ -56,8 +56,11 @@ class JobClaimRepositorySqlTest {
         long placeholderCount = sql.getValue().chars().filter(character -> character == '?').count();
         assertThat(placeholderCount).isEqualTo(arguments.getValue().length);
         assertThat(sql.getValue())
+                .contains("WITH candidate AS")
+                .doesNotContain("WITH expired AS")
                 .contains("FOR UPDATE OF gj SKIP LOCKED")
-                .contains("interval '5 minutes'");
+                .contains("interval '5 minutes'")
+                .contains("gj.scope_id IS NOT DISTINCT FROM b.active_scope_id");
     }
 
     @Test

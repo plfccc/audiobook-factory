@@ -40,6 +40,4 @@ def normalize_language(language: str) -> str:
         raise ValueError("language must not be blank")
     return _LANGUAGE_ALIASES.get(stripped.lower(), stripped)
 
-
 normalize_tts_text = normalize_text
-

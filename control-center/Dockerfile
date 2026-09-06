@@ -65,6 +65,7 @@ ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8"
 USER audiobook
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=25s --retries=6 \
-    CMD curl --silent --fail http://127.0.0.1:8080/actuator/health || exit 1
+    CMD curl --silent --fail -H "Authorization: Bearer $${APP_ACCESS_TOKEN}" \
+        http://127.0.0.1:8080/actuator/health || exit 1
 
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]

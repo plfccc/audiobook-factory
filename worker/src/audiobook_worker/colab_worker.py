@@ -160,6 +160,7 @@ class ColabWorker:
             connect_timeout=settings.control_connect_timeout_seconds,
             read_timeout=settings.control_read_timeout_seconds,
             write_timeout=settings.control_write_timeout_seconds,
+            allow_insecure_http=settings.allow_insecure_http,
             download_timeout=settings.download_timeout_seconds,
         )
         requested_model_id = (

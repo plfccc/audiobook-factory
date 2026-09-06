@@ -80,6 +80,16 @@ def test_control_plane_requires_https_for_non_local_hosts():
     assert ControlPlaneClient("http://127.0.0.1:8080", "worker-token")
 
 
+def test_control_plane_allows_explicit_insecure_http_for_personal_mvp():
+    client = ControlPlaneClient(
+        "http://203.0.113.10:8080",
+        "worker-token",
+        allow_insecure_http=True,
+    )
+
+    assert client.base_url == "http://203.0.113.10:8080"
+
+
 def test_control_plane_rejects_token_in_base_url():
     with pytest.raises(ValueError, match="URL"):
         ControlPlaneClient(

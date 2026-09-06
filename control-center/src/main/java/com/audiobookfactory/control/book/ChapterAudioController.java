@@ -29,11 +29,20 @@ public class ChapterAudioController {
 
     @GetMapping("/{chapterId}/audio")
     public ResponseEntity<Resource> audio(@PathVariable long chapterId) {
+        return audioResponse(chapterId, "inline");
+    }
+
+    @GetMapping("/{chapterId}/audio/download")
+    public ResponseEntity<Resource> download(@PathVariable long chapterId) {
+        return audioResponse(chapterId, "attachment; filename=\"chapter-" + chapterId + ".mp3\"");
+    }
+
+    private ResponseEntity<Resource> audioResponse(long chapterId, String contentDisposition) {
         Path path = jobService.openChapterAudio(chapterId);
         FileSystemResource resource = new FileSystemResource(path);
         ResponseEntity.BodyBuilder response = ResponseEntity.ok()
                 .contentType(AUDIO_MPEG)
-                .header(HttpHeaders.CONTENT_DISPOSITION, "inline");
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition);
         try {
             return response.contentLength(resource.contentLength()).body(resource);
         } catch (IOException exception) {

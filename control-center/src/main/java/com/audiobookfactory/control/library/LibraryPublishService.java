@@ -21,6 +21,7 @@ public class LibraryPublishService {
     private static final String ENV_LIBRARY_ROOT = "AUDIOBOOKSHELF_LIBRARY_ROOT";
     private static final String ENV_LIBRARY_PATH = "AUDIOBOOKSHELF_LIBRARY_PATH";
     private static final String ENV_LIBRARY_ID = "AUDIOBOOKSHELF_LIBRARY_ID";
+    private static final String ENV_ENABLED = "AUDIOBOOKSHELF_ENABLED";
     private static final ChapterCompletionPort NOOP_COMPLETION = (chapterId, finalAudioPath) -> { };
 
     private final FfmpegMediaService mediaService;
@@ -29,12 +30,13 @@ public class LibraryPublishService {
     private final ScanInvoker scanInvoker;
     private final String libraryId;
     private final ChapterCompletionPort completionPort;
+    private final boolean scanEnabled;
 
     @Autowired
     public LibraryPublishService(FfmpegMediaService mediaService, AudiobookshelfClient client,
                                  @Lazy ChapterCompletionPort completionPort) {
         this(mediaService, libraryRootFromEnvironment(), sourceRootFromEnvironment(),
-                client::scan, System.getenv(ENV_LIBRARY_ID), completionPort);
+                client::scan, System.getenv(ENV_LIBRARY_ID), completionPort, enabledFromEnvironment());
     }
 
     public LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot,
@@ -72,6 +74,12 @@ public class LibraryPublishService {
     LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot, Path sourceRoot,
                           ScanInvoker scanInvoker, String libraryId,
                           ChapterCompletionPort completionPort) {
+        this(mediaService, libraryRoot, sourceRoot, scanInvoker, libraryId, completionPort, true);
+    }
+
+    LibraryPublishService(FfmpegMediaService mediaService, Path libraryRoot, Path sourceRoot,
+                          ScanInvoker scanInvoker, String libraryId,
+                          ChapterCompletionPort completionPort, boolean scanEnabled) {
         this.mediaService = Objects.requireNonNull(mediaService, "mediaService must not be null");
         this.libraryRoot = normalizeRoot(libraryRoot, "libraryRoot");
         this.sourceRoot = sourceRoot == null ? null : normalizeRoot(sourceRoot, "sourceRoot");
@@ -79,6 +87,7 @@ public class LibraryPublishService {
         this.libraryId = blankToNull(libraryId);
         this.completionPort = Objects.requireNonNull(completionPort,
                 "completionPort must not be null");
+        this.scanEnabled = scanEnabled;
     }
 
     public Path publishChapter(Chapter chapter, List<AudioAsset> assets) {
@@ -110,13 +119,15 @@ public class LibraryPublishService {
                 || !Files.isRegularFile(merged, LinkOption.NOFOLLOW_LINKS)) {
             throw new PublishException("PUBLISH_FAILED", "Chapter output was not published");
         }
-        try {
-            scanInvoker.scan(libraryId);
-        } catch (FfmpegMediaService.MediaPipelineException | PublishException exception) {
-            throw exception;
-        } catch (RuntimeException exception) {
-            throw new PublishException("AUDIOBOOKSHELF_SCAN_FAILED",
-                    "Audiobookshelf scan failed", exception);
+        if (scanEnabled) {
+            try {
+                scanInvoker.scan(libraryId);
+            } catch (FfmpegMediaService.MediaPipelineException | PublishException exception) {
+                throw exception;
+            } catch (RuntimeException exception) {
+                throw new PublishException("AUDIOBOOKSHELF_SCAN_FAILED",
+                        "Audiobookshelf scan failed", exception);
+            }
         }
         try {
             completionPort.completeChapter(chapter.chapterId(), merged.toString());
@@ -267,6 +278,11 @@ public class LibraryPublishService {
 
     private static String firstNonBlank(String first, String second) {
         return blankToNull(first) != null ? first : blankToNull(second);
+    }
+
+    private static boolean enabledFromEnvironment() {
+        String configured = System.getenv(ENV_ENABLED);
+        return configured == null || configured.isBlank() || Boolean.parseBoolean(configured);
     }
 
     private static String blankToNull(String value) {

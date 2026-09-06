@@ -24,6 +24,7 @@ export interface Chapter {
   segmentCount: number;
   completedSegments: number;
   audioUrl?: string | null;
+  audioDownloadUrl?: string | null;
 }
 
 export interface Segment {

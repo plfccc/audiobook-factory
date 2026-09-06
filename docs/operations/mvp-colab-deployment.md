@@ -1,159 +1,113 @@
-# Audiobook Factory MVP 部署与恢复
+# Audiobook Factory MVP 部署说明
 
-这份文档对应 `infra/mvp/docker-compose.yml`。它只部署单用户控制中心、PostgreSQL 和 Audiobookshelf；Google AI Studio 的浏览器兼容环境仍由 `infra/p0` 单独管理，Colab 只运行 TTS Worker。
+本版本只提供一个公网入口：控制中心 Admin。数据库、Worker、浏览器、代理和 Audiobookshelf 都不发布主机端口。服务器负责导入书籍、管理任务、合并音频，用户从 Admin 下载已经完成的章节。
 
-## 1. 服务边界
+## 1. 访问边界
 
-| 服务 | 容器内端口 | 默认主机绑定 | 用途 |
+生产环境的 Compose 端口规划如下：
+
+| 服务 | 容器端口 | 主机端口 | 说明 |
 | --- | ---: | --- | --- |
-| `control-center` | 8080 | `127.0.0.1:8080` | 上传 EPUB、管理章节任务和回传音频 |
-| `postgres` | 5432 | 不发布 | 持久化业务状态 |
-| `audiobookshelf` | 80 | `127.0.0.1:13378` | 手机/网页播放已发布音频 |
+| `control-center` | 8080 | `0.0.0.0:8080` | 唯一公网入口 |
+| `postgres` | 5432 | 不发布 | 仅 Compose 内网 |
+| `audiobookshelf` | 80 | 不发布 | 暂不作为公网入口，保留后续接入 |
 
-`noVNC:6080`、Chrome CDP `9222` 和代理端口不属于 MVP 公网入口。它们继续只绑定服务器回环地址；不要把它们写入公网 NAT，也不要拿代理端口复用为控制中心端口。
+P0 的 noVNC `6080`、Chrome CDP `9222` 和代理端口也不属于本 Admin，不要在云防火墙或 NAT 中开放它们。已有的代理转发端口应单独管理，不要复用为 Admin 端口。
 
-如果服务器已有 `48878 -> 7891` 的代理转发，保持它不变。控制中心应另外申请一个公网端口或域名，例如：
+本次按用户要求使用明文 HTTP：
 
 ```text
-Colab / 浏览器 HTTPS -> 反向代理 -> 127.0.0.1:8080
-手机 HTTPS       -> 反向代理 -> 127.0.0.1:13378
+http://SERVER_IP:8080
 ```
 
-公网入口必须使用 HTTPS，并由入口层限制来源或要求额外认证；控制中心本身还可以通过 `APP_ACCESS_TOKEN` 对 `/api/v1/**` 和页面请求做 Bearer Token 校验。
+明文 HTTP 会暴露访问令牌和上传/下载内容，只适合个人临时使用。Admin 仍通过 `APP_ACCESS_TOKEN` 保护接口；不要把该令牌与服务器密码、Google 密码或 Worker 注册令牌复用。
 
-## 2. 首次安装
+## 2. 服务器初始化
 
-在 Ubuntu 主机上安装 Docker Engine 和 Compose 插件，然后把仓库放到固定目录：
-
-```bash
-sudo mkdir -p /opt/audiobook-factory
-sudo chown "$USER":"$USER" /opt/audiobook-factory
-git clone https://github.com/plfccc/audiobook-factory.git /opt/audiobook-factory
-cd /opt/audiobook-factory
-```
-
-如果是已有工作树，先确认分支包含 `control-center/src/main/resources/static` 的前端构建产物。修改 `web/` 后，在有 Node.js 的构建机执行：
+将项目放在独立目录，例如 `/opt/audiobook-factory-mvp`，不要覆盖已有 P0 目录。准备目录并设置权限：
 
 ```bash
-npm ci --prefix web
-npm run build --prefix web
-```
-
-准备持久化目录。控制中心镜像使用 UID 10001；Audiobookshelf 镜像通常使用 UID 1000，控制中心通过补充组共享 Library；PostgreSQL 的 Alpine 镜像使用 UID 70：
-
-```bash
+cd /opt/audiobook-factory-mvp
 mkdir -p data/{books,library,diagnostics,sources,.staging,audiobookshelf/config,audiobookshelf/metadata,postgres}
-sudo chown -R 10001:10001 data/books data/sources data/.staging data/diagnostics
-sudo chown -R 1000:1000 data/library data/audiobookshelf
-sudo chmod -R ug+rwX data/library data/audiobookshelf
-sudo chown -R 70:70 data/postgres
+chown -R 10001:10001 data/books data/sources data/.staging data/diagnostics
+chown -R 1000:1000 data/library data/audiobookshelf
+chmod -R ug+rwX data/library data/audiobookshelf
+chown -R 70:70 data/postgres
 ```
 
-若目标版本的 Audiobookshelf 使用的运行 UID 不是 1000，请用 `docker run --rm advplyr/audiobookshelf:2.21.0 id` 查询后替换上面的 UID，并同步修改 Compose 中的 `group_add`；不要为了绕过权限问题直接公开容器端口或把所有服务改成特权用户。
-
-创建真实环境文件。不要把它提交 Git，也不要在聊天记录中粘贴 Token 或订阅地址：
+复制并编辑环境变量：
 
 ```bash
 cp infra/mvp/.env.example infra/mvp/.env
 chmod 600 infra/mvp/.env
-${EDITOR:-vi} infra/mvp/.env
 ```
 
-至少替换以下示例值：
+个人 HTTP 直连至少使用下面配置：
 
 ```text
-DB_PASSWORD
-WORKER_ENROLL_TOKEN
-APP_ACCESS_TOKEN
-AUDIOBOOKSHELF_LIBRARY_ID
-AUDIOBOOKSHELF_API_KEY
+CONTROL_CENTER_BIND_ADDRESS=0.0.0.0
+CONTROL_CENTER_PORT=8080
+AUDIOBOOKSHELF_ENABLED=false
 ```
 
-启动脚本会拒绝 `change-me` 和 `replace-me` 开头的值：
+还必须替换 `DB_PASSWORD`、`WORKER_ENROLL_TOKEN` 和 `APP_ACCESS_TOKEN`。`AUDIOBOOKSHELF_ENABLED=false` 时，空的 Audiobookshelf 配置不会阻止 Admin 启动；已合并的 MP3 仍会写入 `/data/library` 并可下载。
+
+启动和检查：
 
 ```bash
 bash infra/mvp/start.sh
 docker compose --env-file infra/mvp/.env -f infra/mvp/docker-compose.yml ps
-curl --fail http://127.0.0.1:8080/actuator/health
+curl --fail -H "Authorization: Bearer ${APP_ACCESS_TOKEN}" http://127.0.0.1:8080/actuator/health
 ```
 
-控制中心默认不直接暴露公网。先在服务器上用 SSH 隧道验证：
+云服务器安全组或 NAT 只需要放行 `8080/tcp` 到该控制中心；如果云平台需要端口映射，使用 `公网端口 -> 服务器 8080`。不要放行 5432、13378、6080、7890、7891、9090、9222。
 
-```bash
-ssh -L 8080:127.0.0.1:8080 -L 13378:127.0.0.1:13378 root@SERVER_IP
-```
+## 3. Admin 使用方式
 
-本机访问 `http://127.0.0.1:8080` 或 `http://127.0.0.1:13378`。配置了 `APP_ACCESS_TOKEN` 时，页面收到 401 会显示令牌输入框；令牌仅保存于当前浏览器的 `sessionStorage`。
+打开 `http://SERVER_IP:8080`，首次请求返回 401 时，在页面输入 `APP_ACCESS_TOKEN`。令牌只保存在当前浏览器的 `sessionStorage`。
 
-## 3. 反向代理与 Colab
+使用流程：
 
-反向代理只转发控制中心或 Audiobookshelf 的 HTTP 服务。示例（把域名和证书路径替换为自己的值）：
+1. 导入 EPUB，等待章节解析完成。
+2. 选择章节，先生成试听任务确认音色和参数。
+3. 正式生成时设置章节数，单次最多 20 章；后端仍以章节为最小可见进度节点，片段只用于内部断点续跑。
+4. 章节完成后，列表出现“播放”和“下载”；下载地址为 `/api/v1/chapters/{chapterId}/audio/download`。
+5. 下载到本地后，可以按磁盘空间清理服务器上的 `data/library`，不要删除正在生成的 `.staging` 文件。
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name book.example.com;
+## 4. Colab Worker
 
-    ssl_certificate     /etc/letsencrypt/live/book.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/book.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-```
-
-反向代理新增的公网端口必须与 `infra/p0` 的代理端口不同。Colab Notebook 中填写：
+Colab Notebook 使用以下 Secret：
 
 ```text
-CONTROL_PLANE_URL=https://book.example.com
-AUDIOBOOK_WORKER_TOKEN=<.env 中的 WORKER_ENROLL_TOKEN>
+AUDIOBOOK_CONTROL_URL=http://SERVER_IP:8080
+AUDIOBOOK_WORKER_TOKEN=<WORKER_ENROLL_TOKEN>
+AUDIOBOOK_ALLOW_INSECURE_HTTP=true
 ```
 
-Worker 首次注册后会获得短期 Worker Token；该 Token 只放在 Colab 运行时 Secret 或环境变量中，不写入 Notebook、任务快照或 Git。
+`AUDIOBOOK_ALLOW_INSECURE_HTTP=true` 是个人 HTTP 部署的显式开关，默认关闭。Notebook 不保存真实令牌，也不自动输入 Google 账号密码；首次使用仍需在 Google/AI Studio 浏览器环境中完成登录或验证。
 
-建议启动顺序：
+Worker 会自动探测当前 Colab GPU，并从可用模型中选择兼容配置；没有 CUDA/GPU 时进入等待状态，不会默默用服务器 CPU 跑长篇任务。
 
-1. 先启动 MVP 控制中心并确认 `/actuator/health` 为 UP。
-2. 再打开 `notebooks/audiobook_factory_colab.ipynb`，填写控制中心 HTTPS 地址和 Worker Token。
-3. Colab 运行时自动探测 CUDA/GPU，并只加载当前显存兼容的模型；未准备本地权重时不要切换到候选模型。
-4. 页面导入 EPUB，选择章节试听，确认声音后提交整章或后续章节生成。
+## 5. 后续启用 Audiobookshelf
 
-Worker 通过 HTTPS 领取最小片段任务，心跳续租，上传 WAV 后由服务端做格式、时长、SHA256 校验。章节全部完成后才会合并并发布到 Audiobookshelf。
+后续需要手机播放和断点播放时，再在服务器内网初始化 Audiobookshelf，配置：
 
-单章部署验收步骤和证据表见 [`mvp-acceptance.md`](mvp-acceptance.md)；命令行烟囱测试使用仓库中的 `scripts/mvp-smoke.sh`。
+```text
+AUDIOBOOKSHELF_ENABLED=true
+AUDIOBOOKSHELF_BASE_URL=http://audiobookshelf:80
+AUDIOBOOKSHELF_LIBRARY_ID=<library-id>
+AUDIOBOOKSHELF_API_KEY=<api-key>
+```
 
-## 4. 日常运维
+即使启用，也不需要给 Audiobookshelf 发布公网端口；后续 Android App 应通过单独的受保护 API 或服务端适配层接入。
+
+## 6. 日常运维
 
 ```bash
-cd /opt/audiobook-factory
+cd /opt/audiobook-factory-mvp
 docker compose --env-file infra/mvp/.env -f infra/mvp/docker-compose.yml ps
 docker compose --env-file infra/mvp/.env -f infra/mvp/docker-compose.yml logs --tail=200 control-center
-docker compose --env-file infra/mvp/.env -f infra/mvp/docker-compose.yml logs --tail=200 postgres
 docker compose --env-file infra/mvp/.env -f infra/mvp/docker-compose.yml restart control-center
 ```
 
-只重启控制中心不会删除数据库、书籍或音频。禁止用 `docker compose down -v`，因为这会删除 Compose 管理的卷；本 Compose 使用主机目录，仍应把 `data/` 纳入备份。
-
-低磁盘时先暂停书籍任务，再清理确认无用的诊断截图和已验证的中间 WAV。不要删除正在运行任务的 `.staging` 或 Worker 输出目录。
-
-## 5. 认证、密钥和恢复
-
-- `APP_ACCESS_TOKEN` 是控制中心页面/API 的 Bearer Token；没有它时，必须依赖 HTTPS 反向代理的访问控制。
-- `WORKER_ENROLL_TOKEN` 只用于 Worker 首次注册；Worker 获得的运行 Token 不要与它混用。
-- `AUDIOBOOKSHELF_API_KEY` 只写在服务器 `infra/mvp/.env`，不写入浏览器和任务快照。
-- `data/audiobookshelf/config`、`data/audiobookshelf/metadata`、`data/postgres`、`data/books` 和 `data/library` 都需要备份。
-- Chrome 登录 profile 仍属于 P0 浏览器运行时，含 Google 会话 Cookie；只允许浏览器容器挂载，权限保持 700，不要同步到网盘。
-
-服务器重启后的恢复顺序：
-
-```bash
-cd /opt/audiobook-factory
-bash infra/mvp/start.sh
-curl --fail http://127.0.0.1:8080/actuator/health
-```
-
-然后重新启动 Colab Worker。Worker 会从控制中心重新注册，过期 Lease 会被回收为 WAITING，已成功章节不会重复生成。若 Google 登录、配额或页面状态需要人工处理，Worker 会暂停并在日志中报告 `AUTH_REQUIRED`、`QUOTA_PAUSED` 或 `HUMAN_REQUIRED`。
+不要使用 `docker compose down -v`，也不要直接删除 `data/`。备份 PostgreSQL、源 EPUB、最终 MP3 和配置文件；浏览器 profile 可能包含 Google 会话 Cookie，不能上传网盘或提交 Git。

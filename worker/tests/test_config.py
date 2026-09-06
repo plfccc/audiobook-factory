@@ -37,6 +37,12 @@ def test_settings_load_all_environment_aliases(monkeypatch, tmp_path):
     assert (settings.generation_timeout_seconds, settings.download_timeout_seconds, settings.max_attempts) == (90, 45, 4)
 
 
+def test_settings_can_explicitly_allow_insecure_http_for_personal_mvp(monkeypatch):
+    monkeypatch.setenv("AUDIOBOOK_ALLOW_INSECURE_HTTP", "true")
+
+    assert WorkerSettings().allow_insecure_http is True
+
+
 @pytest.mark.parametrize("name", ["GENERATION_TIMEOUT_SECONDS", "DOWNLOAD_TIMEOUT_SECONDS", "MAX_ATTEMPTS"])
 def test_settings_reject_non_positive_bounds(monkeypatch, name):
     monkeypatch.setenv(name, "0")

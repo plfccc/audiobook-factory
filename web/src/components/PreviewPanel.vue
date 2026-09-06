@@ -23,6 +23,7 @@ const stylePrompt = ref("自然、清晰、语速稳定地朗读，不添加额�
 const referenceText = ref("");
 const referenceFileName = ref("");
 const segmentIndex = ref(1);
+const chapterCount = ref(1);
 const busy = ref(false);
 
 const selectedModel = computed(() => props.models.find((model) => model.modelId === selectedModelId.value) ?? null);
@@ -99,7 +100,7 @@ async function submit(kind: "preview" | "generation"): Promise<void> {
       : await startGeneration(props.bookId, {
           ...body,
           chapterStart: props.selectedChapter.chapterNumber,
-          chapterEnd: props.selectedChapter.chapterNumber,
+          chapterEnd: props.selectedChapter.chapterNumber + Math.min(20, Math.max(1, chapterCount.value)) - 1,
         });
     emit("submitted", batch);
   } catch (error) {
@@ -150,6 +151,10 @@ async function submit(kind: "preview" | "generation"): Promise<void> {
         <label>
           <span>试听片段序号（从 1 开始）</span>
           <input v-model.number="segmentIndex" type="number" min="1" step="1" />
+        </label>
+        <label>
+          <span>正式生成章节数（1-20）</span>
+          <input v-model.number="chapterCount" type="number" min="1" max="20" step="1" />
         </label>
         <label>
           <span>参考音频</span>

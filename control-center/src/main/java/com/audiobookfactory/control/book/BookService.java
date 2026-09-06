@@ -117,6 +117,9 @@ public class BookService {
                 toInt(resultSet.getLong("completed_segments")),
                 resultSet.getString("final_audio_path") != null
                         ? "/api/v1/chapters/" + resultSet.getLong("id") + "/audio"
+                        : null,
+                resultSet.getString("final_audio_path") != null
+                        ? "/api/v1/chapters/" + resultSet.getLong("id") + "/audio/download"
                         : null), bookId);
     }
 
@@ -255,7 +258,8 @@ public class BookService {
             String status,
             int segmentCount,
             int completedSegments,
-            String audioUrl) {
+            String audioUrl,
+            String audioDownloadUrl) {
     }
 
     public record SegmentView(

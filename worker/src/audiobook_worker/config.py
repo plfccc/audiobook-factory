@@ -13,6 +13,12 @@ class WorkerSettings(BaseSettings):
         default="http://control-center:8080",
         validation_alias=AliasChoices("AUDIOBOOK_CONTROL_URL", "CONTROL_PLANE_URL"),
     )
+    allow_insecure_http: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "AUDIOBOOK_ALLOW_INSECURE_HTTP", "ALLOW_INSECURE_HTTP"
+        ),
+    )
     worker_token: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices("AUDIOBOOK_WORKER_TOKEN", "WORKER_TOKEN"),

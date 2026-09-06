@@ -81,7 +81,10 @@ function segmentPreview(text: string): string {
               <span class="mini-progress-track"><span :style="{ width: `${progressPercent(chapter)}%` }"></span></span>
             </td>
             <td>
-              <a v-if="chapter.audioUrl" class="audio-link" :href="chapter.audioUrl" target="_blank" rel="noreferrer">播放</a>
+              <template v-if="chapter.audioUrl">
+                <a class="audio-link" :href="chapter.audioUrl" target="_blank" rel="noreferrer">播放</a>
+                <a v-if="chapter.audioDownloadUrl" class="audio-link" :href="chapter.audioDownloadUrl">下载</a>
+              </template>
               <span v-else class="muted">—</span>
             </td>
           </tr>

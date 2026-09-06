@@ -25,6 +25,7 @@ app:
   access-token: ${APP_ACCESS_TOKEN:}
 
 audiobookshelf:
+  enabled: ${AUDIOBOOKSHELF_ENABLED:true}
   base-url: ${AUDIOBOOKSHELF_BASE_URL:}
   library-id: ${AUDIOBOOKSHELF_LIBRARY_ID:}
   api-key: ${AUDIOBOOKSHELF_API_KEY:}

@@ -81,4 +81,32 @@ class LibraryPublishServiceTest {
 
         verify(completionPort, never()).completeChapter(anyLong(), anyString());
     }
+
+    @Test
+    void disabledAudiobookshelfStillPublishesAudioForDownload() throws IOException {
+        Path libraryRoot = Files.createTempDirectory("library-publish-download-");
+        Path segment = Files.write(libraryRoot.resolve("segment.wav"), new byte[2048]);
+        Path published = libraryRoot.resolve("book").resolve("001 - chapter.mp3");
+        FfmpegMediaService mediaService = mock(FfmpegMediaService.class);
+        ChapterCompletionPort completionPort = mock(ChapterCompletionPort.class);
+        List<String> events = new ArrayList<>();
+        when(mediaService.mergeChapter(any(), any(), any())).thenAnswer(invocation -> {
+            Files.createDirectories(published.getParent());
+            Files.write(published, new byte[2048]);
+            events.add("merge");
+            return published;
+        });
+        LibraryPublishService.ScanInvoker scan = ignored -> events.add("scan");
+        LibraryPublishService publisher = new LibraryPublishService(
+                mediaService, libraryRoot, libraryRoot, scan, "library-1", completionPort, false);
+
+        Path result = publisher.publishChapter(
+                new LibraryPublishService.Chapter(8L, "book", 1, "chapter"),
+                List.of(new LibraryPublishService.AudioAsset(1, segment)));
+
+        assertThat(result).isEqualTo(published);
+        assertThat(events).containsExactly("merge");
+        verify(completionPort).completeChapter(8L, published.toString());
+        verify(completionPort).completeChapter(anyLong(), anyString());
+    }
 }

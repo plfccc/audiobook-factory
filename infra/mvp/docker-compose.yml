@@ -30,6 +30,7 @@ services:
       STORAGE_ROOT: ${STORAGE_ROOT:-/data}
       WORKER_ENROLL_TOKEN: ${WORKER_ENROLL_TOKEN:-change-me-worker-token}
       APP_ACCESS_TOKEN: ${APP_ACCESS_TOKEN:-change-me-app-token}
+      AUDIOBOOKSHELF_ENABLED: ${AUDIOBOOKSHELF_ENABLED:-false}
       AUDIOBOOKSHELF_BASE_URL: ${AUDIOBOOKSHELF_BASE_URL:-http://audiobookshelf:80}
       AUDIOBOOKSHELF_LIBRARY_ID: ${AUDIOBOOKSHELF_LIBRARY_ID:-}
       AUDIOBOOKSHELF_API_KEY: ${AUDIOBOOKSHELF_API_KEY:-}
@@ -67,8 +68,6 @@ services:
       - ../../data/library:/audiobooks
       - ../../data/audiobookshelf/config:/config
       - ../../data/audiobookshelf/metadata:/metadata
-    ports:
-      - "${AUDIOBOOKSHELF_BIND_ADDRESS:-127.0.0.1}:${AUDIOBOOKSHELF_PORT:-13378}:80"
     networks:
       - mvp
     healthcheck:

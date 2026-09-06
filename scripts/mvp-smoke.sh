@@ -137,12 +137,15 @@ if not chapter:
     raise SystemExit("未找到第一章")
 status = chapter.get("status", "unknown")
 audio_url = chapter.get("audioUrl") or ""
+audio_download_url = chapter.get("audioDownloadUrl") or ""
 if status != "SUCCESS":
     raise SystemExit("第一章未成功：{}".format(status))
 if not audio_url.startswith("/"):
     raise SystemExit("第一章音频地址不是相对 API 路径")
-print("{}\\t{}".format(status, audio_url))' <<<"$chapters")"
-IFS=$'\t' read -r chapter_status audio_url <<<"$chapter_info"
+if not audio_download_url.startswith("/"):
+    raise SystemExit("audioDownloadUrl must be an API-relative path")
+print("{}\\t{}\\t{}".format(status, audio_url, audio_download_url))' <<<"$chapters")"
+IFS=$'\t' read -r chapter_status audio_url audio_download_url <<<"$chapter_info"
 printf '第一章状态：%s\n音频地址：%s\n' "$chapter_status" "$audio_url"
 audio_content_type="$(curl --silent --show-error --fail --location \
   --connect-timeout 15 --max-time 60 \
@@ -154,6 +157,19 @@ case "$audio_content_type" in
   audio/mpeg*) ;;
   *)
     echo "章节音频响应类型异常：${audio_content_type}" >&2
+    exit 1
+    ;;
+esac
+download_content_type="$(curl --silent --show-error --fail --location \
+  --connect-timeout 15 --max-time 60 \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H 'Accept: audio/mpeg' \
+  -o /dev/null -w '%{content_type}' \
+  "${BASE_URL}${audio_download_url}")"
+case "$download_content_type" in
+  audio/mpeg*) ;;
+  *)
+    echo "download audio response type is invalid: ${download_content_type}" >&2
     exit 1
     ;;
 esac

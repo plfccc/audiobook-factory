@@ -1,42 +1,64 @@
 # MVP 验收记录
 
-本文用于记录“控制中心 + Colab Worker + Audiobookshelf”单章链路的真实验收证据。MVP 以章节为最小进度节点；不要求全书完成后才可试听或收听。
+本记录用于验证“单 Admin + Colab Worker + 章节音频下载”闭环。章节是用户可见的最小进度节点，片段只负责内部生成、校验和断点续跑。
 
 ## 验收范围
 
-- 控制中心能够导入 EPUB，并解析章节与生成任务。
-- Colab Worker 能通过 Worker Token 注册、领取第一章任务并回传 WAV。
-- 控制中心会校验 WAV 的大小、编码、时长、可解码性和 SHA-256。
-- 第一章所有任务成功后，控制中心合并为 MP3，写入 Audiobookshelf Library 目录并触发扫描。
-- 进度接口返回 `completedChapters / totalChapters / currentChapter`，章节接口返回可播放音频地址。
-- 服务重启、配额暂停、Google 登录失效等异常不在本次单章闭环中伪造通过；需要在真实 Colab Worker 验收时记录。
+- Admin 能导入 EPUB，解析章节并提交试听或按范围生成任务。
+- Colab Worker 能注册、领取任务、生成并上传 WAV。
+- 控制中心能校验 WAV、合并 MP3，并在章节列表返回播放和下载地址。
+- 下载接口能返回 `audio/mpeg` 与附件响应头。
+- 服务器只公开控制中心端口，数据库、浏览器、代理和 Audiobookshelf 不公开。
+- Worker 掉线、任务失败、额度暂停和登录失效能够保留状态并支持恢复。
 
-## 测试入口
+## 本地验证
 
-### 本地控制中心合同测试
+Java 控制中心单元测试：
 
-需要本机 Docker Desktop/daemon 和 FFmpeg：
-
-```text
-C:\Users\lingpfeng.peng\.codex\bin\mvn-auto.cmd -f control-center/pom.xml -Dtest=MvpContractTest test
+```powershell
+C:\Users\lingpfeng.peng\.codex\bin\mvn-auto.cmd -f control-center/pom.xml test
 ```
 
-该测试使用 Testcontainers 启动 PostgreSQL，fake Worker 生成确定性的合法 WAV，并用本地 FFmpeg 完成合并；Audiobookshelf HTTP 客户端在该测试中替换为 fake publish port，因此它验证的是控制中心闭环而不是外部服务网络。
+前端检查：
 
-### 真实服务器单章烟囱测试
+```powershell
+npm --prefix web run typecheck
+npm --prefix web run test
+npm --prefix web run build
+```
 
-先确保控制中心已经启动、Colab Worker 已注册并保持轮询，再执行：
+Worker 合同测试：
+
+```powershell
+python -m pytest -q worker/tests
+```
+
+Windows 本地没有 `ffprobe` 或 Docker 时，音频校验测试和 Testcontainers 测试会因环境缺失而失败；应在服务器容器环境或安装依赖后复验，不能把这类失败误判为业务通过。
+
+## 服务器烟囱测试
+
+先确认 Admin 已启动、Colab Worker 已注册并保持轮询：
 
 ```bash
 bash scripts/mvp-smoke.sh \
-  --base-url https://book.example.com \
+  --base-url http://SERVER_IP:8080 \
   --epub examples/mvp-sample.epub \
   --access-token '<APP_ACCESS_TOKEN>'
 ```
 
-脚本不会输出访问令牌；它会导入示例书、提交第一章、轮询章节进度，并检查第一章是否已发布音频地址。真实生产验收应使用专用测试书，避免重复导入或占用正式书籍任务。
+烟囱脚本会导入示例书、提交第一章、等待完成，并检查章节的 `audioUrl` 和 `audioDownloadUrl` 均为相对 API 路径。真实生产验收应使用单独的测试书，避免与正式任务混用。
 
-## 证据记录表
+## 手工检查清单
+
+1. 浏览器打开 `http://SERVER_IP:8080`，输入 `APP_ACCESS_TOKEN` 后页面可用。
+2. 导入 EPUB 后能看到章节列表和章节数。
+3. 试听任务能提交；正式任务可填写 1～20 章的批次。
+4. 第一章状态为 `SUCCESS` 时出现“播放”和“下载”。
+5. 播放地址返回 `audio/mpeg`；下载地址返回 `Content-Disposition: attachment`。
+6. 云防火墙/NAT 仅放行 Admin 端口；从公网无法访问 5432、13378、6080、7890、7891、9090、9222。
+7. 下载文件保存到本地后，确认服务器上的临时文件和源文件仍按清理策略保留或删除。
+
+## 证据记录
 
 | 项目 | 记录 |
 | --- | --- |
@@ -44,31 +66,8 @@ bash scripts/mvp-smoke.sh \
 | 控制中心版本 / Git commit | 待填写 |
 | 服务器系统与 Docker 版本 | 待填写 |
 | Colab GPU 型号 | 待填写 |
-| CUDA / PyTorch 版本 | 待填写 |
-| 实际 TTS 引擎 | `qwen3-tts` |
-| 实际模型版本 | 待填写；记录 Hugging Face revision 或 Colab 输出 |
-| 试听/生成章节 | `1` |
-| 生成任务数 | 待填写 |
-| 第一章音频时长 | 待填写 |
-| 第一章音频 SHA-256 | 待填写 |
-| MP3 文件路径 | 待填写 |
-| Audiobookshelf Library ID | 待填写 |
-| Audiobookshelf 扫描结果 | 待填写：成功 / 失败及日志摘要 |
-| 手机端播放结果 | 待填写 |
-
-## 通过标准
-
-1. `MvpContractTest` 在 Docker 和 FFmpeg 可用的环境中通过。
-2. 真实脚本最终输出 `MVP 单章烟囱测试通过。`。
-3. 第一章状态为 `SUCCESS`，章节返回 `audioUrl`，并可通过该地址读取 `audio/mpeg`。
-4. Audiobookshelf 扫描后能看到书籍和第一章；手机端能播放且时长大于零。
-5. 任务失败时，后台显示可诊断的错误状态，且不会把 Worker Token、访问令牌或代理订阅地址写入任务快照和日志。
-
-## 未通过时的排查顺序
-
-1. 控制中心健康检查与日志。
-2. Worker 是否注册成功、是否能领取任务、Worker Token 是否过期。
-3. Colab GPU、模型下载和显存日志。
-4. WAV 是否真实生成，`ffprobe` 是否能解码。
-5. `/data/library` 权限和 Audiobookshelf 扫描日志。
-6. 仅在确认服务端链路正常后，检查公网 HTTPS、反向代理和服务器防火墙。
+| 实际 TTS 模型与版本 | 待填写 |
+| 生成章节数 / 任务数 | 待填写 |
+| 音频 SHA-256 与时长 | 待填写 |
+| Admin 公网地址 | 待填写 |
+| 公网端口扫描结果 | 待填写 |

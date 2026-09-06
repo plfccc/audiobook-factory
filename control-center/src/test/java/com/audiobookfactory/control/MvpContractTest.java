@@ -180,6 +180,7 @@ class MvpContractTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].status").value("SUCCESS"))
                 .andExpect(jsonPath("$[0].audioUrl").value("/api/v1/chapters/1/audio"))
+                .andExpect(jsonPath("$[0].audioDownloadUrl").value("/api/v1/chapters/1/audio/download"))
                 .andReturn();
         JsonNode chapter = objectMapper.readTree(chapters.getResponse().getContentAsString()).get(0);
         long chapterId = chapter.path("id").asLong(0);
@@ -190,6 +191,12 @@ class MvpContractTest {
         mockMvc.perform(get("/api/v1/chapters/{chapterId}/audio", chapterId))
                 .andExpect(status().isOk())
                 .andExpect(content().contentType(MediaType.parseMediaType("audio/mpeg")));
+
+        mockMvc.perform(get("/api/v1/chapters/{chapterId}/audio/download", chapterId))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.parseMediaType("audio/mpeg")))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                        .string("Content-Disposition", "attachment; filename=\"chapter-" + chapterId + ".mp3\""));
     }
 
     private Object publishWithLocalFfmpeg(InvocationOnMock invocation) {

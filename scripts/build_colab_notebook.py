@@ -63,6 +63,7 @@ def _required_secret(name: str) -> str:
 
 os.environ["AUDIOBOOK_CONTROL_URL"] = _required_secret("AUDIOBOOK_CONTROL_URL")
 os.environ["AUDIOBOOK_WORKER_TOKEN"] = _required_secret("AUDIOBOOK_WORKER_TOKEN")
+os.environ["AUDIOBOOK_ALLOW_INSECURE_HTTP"] = userdata.get("AUDIOBOOK_ALLOW_INSECURE_HTTP") or "false"
 ''',
         '''import asyncio
 import json

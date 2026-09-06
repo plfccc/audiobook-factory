@@ -71,7 +71,7 @@ class ControlPlaneError(RuntimeError):
 
 
 class ControlPlaneClient:
-    """Small async HTTPS client for the Colab Worker control protocol."""
+    """Small async HTTP(S) client for the Colab Worker control protocol."""
 
     def __init__(
         self,
@@ -83,6 +83,7 @@ class ControlPlaneClient:
         read_timeout: float = 60.0,
         write_timeout: float = 120.0,
         pool_timeout: float = 10.0,
+        allow_insecure_http: bool = False,
         download_timeout: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         http_client: httpx.AsyncClient | None = None,
@@ -91,7 +92,11 @@ class ControlPlaneClient:
             raise ValueError("base_url must not be blank")
         if not isinstance(token, str) or not token.strip():
             raise ValueError("token must not be blank")
-        self.base_url = _validate_base_url(base_url, token)
+        self.base_url = _validate_base_url(
+            base_url,
+            token,
+            allow_insecure_http=allow_insecure_http,
+        )
         self._token = token
         self._transport = transport
         self._client = http_client
@@ -550,7 +555,12 @@ def validate_job_id(job_id: str) -> str:
     return job_id
 
 
-def _validate_base_url(base_url: str, token: str) -> str:
+def _validate_base_url(
+    base_url: str,
+    token: str,
+    *,
+    allow_insecure_http: bool = False,
+) -> str:
     candidate = base_url.strip()
     try:
         parsed = urlsplit(candidate)
@@ -570,7 +580,11 @@ def _validate_base_url(base_url: str, token: str) -> str:
         raise ValueError("base_url must contain a valid host") from error
     if not hostname:
         raise ValueError("base_url must contain a host")
-    if parsed.scheme.lower() == "http" and hostname.lower() not in _LOCAL_CONTROL_HOSTS:
+    if (
+        parsed.scheme.lower() == "http"
+        and not allow_insecure_http
+        and hostname.lower() not in _LOCAL_CONTROL_HOSTS
+    ):
         raise ValueError("HTTPS is required for non-local control-plane URLs")
     if token and token in candidate:
         raise ValueError("base_url must not contain the worker token in the URL")

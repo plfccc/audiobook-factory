@@ -87,6 +87,34 @@ class AccessTokenFilterTest {
         assertThat(chainCalled).isTrue();
     }
 
+    @Test
+    void allowsTheAdminShellWithoutAnAccessToken() throws ServletException, IOException {
+        AccessTokenFilter filter = new AccessTokenFilter(appPropertiesWithAccessToken("ui-token"));
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRequestURI("/");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean chainCalled = new AtomicBoolean();
+
+        filter.doFilter(request, response, recordingChain(chainCalled));
+
+        assertThat(response.getStatus()).isEqualTo(200);
+        assertThat(chainCalled).isTrue();
+    }
+
+    @Test
+    void allowsAdminAssetsWithoutAnAccessToken() throws ServletException, IOException {
+        AccessTokenFilter filter = new AccessTokenFilter(appPropertiesWithAccessToken("ui-token"));
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRequestURI("/assets/index.js");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicBoolean chainCalled = new AtomicBoolean();
+
+        filter.doFilter(request, response, recordingChain(chainCalled));
+
+        assertThat(response.getStatus()).isEqualTo(200);
+        assertThat(chainCalled).isTrue();
+    }
+
     private AppProperties appPropertiesWithAccessToken(String token) {
         AppProperties appProperties = new AppProperties();
         appProperties.setAccessToken(token);

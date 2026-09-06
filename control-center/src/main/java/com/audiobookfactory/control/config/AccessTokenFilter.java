@@ -63,7 +63,10 @@ public class AccessTokenFilter extends OncePerRequestFilter {
             requestUri = requestUri.substring(contextPath.length());
         }
         return requestUri.startsWith(WORKER_API_PREFIX)
-                || requestUri.startsWith(ASSET_API_PREFIX);
+                || requestUri.startsWith(ASSET_API_PREFIX)
+                || requestUri.equals("/")
+                || requestUri.equals("/index.html")
+                || requestUri.startsWith("/assets/");
     }
 
     private void reject(HttpServletResponse response) {

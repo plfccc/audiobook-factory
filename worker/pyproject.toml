@@ -15,6 +15,11 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]
 runtime = ["torch>=2.7,<3"]
+colab = [
+    "numpy>=2,<3",
+    "soundfile>=0.12,<1",
+    "torch>=2.7,<3",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/audiobook_worker"]

@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: audiobook_factory
+      POSTGRES_USER: ${DB_USERNAME:-audiobook}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+    volumes:
+      - ../../data/postgres:/var/lib/postgresql/data
+    networks:
+      - mvp
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  control-center:
+    image: audiobook-factory/control-center:0.1.0
+    build:
+      context: ../../control-center
+      dockerfile: Dockerfile
+    environment:
+      PORT: "8080"
+      DB_URL: ${DB_URL:-jdbc:postgresql://postgres:5432/audiobook_factory}
+      DB_USERNAME: ${DB_USERNAME:-audiobook}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
+      STORAGE_ROOT: ${STORAGE_ROOT:-/data}
+      WORKER_ENROLL_TOKEN: ${WORKER_ENROLL_TOKEN:-change-me-worker-token}
+      APP_ACCESS_TOKEN: ${APP_ACCESS_TOKEN:-change-me-app-token}
+      AUDIOBOOKSHELF_BASE_URL: ${AUDIOBOOKSHELF_BASE_URL:-http://audiobookshelf:80}
+      AUDIOBOOKSHELF_LIBRARY_ID: ${AUDIOBOOKSHELF_LIBRARY_ID:-}
+      AUDIOBOOKSHELF_API_KEY: ${AUDIOBOOKSHELF_API_KEY:-}
+      AUDIOBOOKSHELF_LIBRARY_ROOT: /data/library
+    volumes:
+      - ../../data/books:/data/books
+      - ../../data/sources:/data/sources
+      - ../../data/.staging:/data/.staging
+      - ../../data/library:/data/library
+      - ../../data/diagnostics:/data/diagnostics
+    group_add:
+      - "1000"
+    ports:
+      - "${CONTROL_CENTER_BIND_ADDRESS:-127.0.0.1}:${CONTROL_CENTER_PORT:-8080}:8080"
+    networks:
+      - mvp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      audiobookshelf:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "http://127.0.0.1:8080/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 25s
+    restart: unless-stopped
+
+  audiobookshelf:
+    image: advplyr/audiobookshelf:2.21.0
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ../../data/library:/audiobooks
+      - ../../data/audiobookshelf/config:/config
+      - ../../data/audiobookshelf/metadata:/metadata
+    ports:
+      - "${AUDIOBOOKSHELF_BIND_ADDRESS:-127.0.0.1}:${AUDIOBOOKSHELF_PORT:-13378}:80"
+    networks:
+      - mvp
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:80"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+networks:
+  mvp:
+    name: audiobook-factory-mvp
+    driver: bridge

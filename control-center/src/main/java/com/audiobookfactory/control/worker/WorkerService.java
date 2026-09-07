@@ -97,16 +97,18 @@ public class WorkerService {
                 jdbcTemplate.execute("SELECT pg_advisory_xact_lock(" + ENROLLMENT_LOCK_KEY + ")");
                 String workerToken = generateToken();
                 List<ExistingRegistration> existing = jdbcTemplate.query("""
-                        SELECT worker_id, name
+                        SELECT worker_id, name, status
                         FROM worker_registration
                         ORDER BY updated_at DESC
                         LIMIT 1
                         """, (resultSet, rowNum) -> new ExistingRegistration(
-                        resultSet.getString("worker_id"), resultSet.getString("name")));
+                        resultSet.getString("worker_id"), resultSet.getString("name"),
+                        resultSet.getString("status")));
                 if (!existing.isEmpty()) {
                     ExistingRegistration registration = existing.get(0);
                     // 单用户部署只允许原 Worker 名称重新入站，避免 enrollment token 被用来替换任意 Worker。
-                    if (!registration.name().equals(workerName)) {
+                    if (!canReplaceExistingRegistration(
+                            registration.name(), registration.status(), workerName)) {
                         throw unauthorized();
                     }
                     jdbcTemplate.update("""
@@ -347,6 +349,14 @@ public class WorkerService {
         return new ApiException("WORKER_UNAUTHORIZED", 401, "Worker authorization is required");
     }
 
+    static boolean canReplaceExistingRegistration(
+            String existingName, String existingStatus, String requestedName) {
+        if (Objects.equals(existingName, requestedName)) {
+            return true;
+        }
+        return existingStatus != null && !"ACTIVE".equalsIgnoreCase(existingStatus);
+    }
+
     private boolean constantTimeEquals(String expected, String supplied) {
         if (expected == null || supplied == null) {
             return false;
@@ -381,7 +391,7 @@ public class WorkerService {
     private record WorkerRow(String workerId, String name, String status, Timestamp createdAt) {
     }
 
-    private record ExistingRegistration(String workerId, String name) {
+    private record ExistingRegistration(String workerId, String name, String status) {
     }
 
     private record WorkerStatusRow(String workerId, String name, String status,
